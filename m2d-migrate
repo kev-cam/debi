@@ -80,13 +80,16 @@ copy_etc 'ssh/ssh_host_*' 'ssh/sshd_config.d/*' 'ssh/ssh_config.d/*' \
 # Mint's own kernel log -- otherwise leave them and shout.
 # (6.x kernels log the UUID on mount; 5.x only "re-mounted ... errors=remount-ro" for /)
 mint_seen=$(zgrep -ahoE "EXT4-fs \(sd[a-z]+[0-9]+\): (mounted filesystem $MINT_UUID|re-mounted. Opts: errors=remount-ro)" \
-    $(ls -tr "$MINT"/var/log/kern.log* 2>/dev/null) 2>/dev/null | tail -1 | sed -E 's/.*\((sd[a-z]+[0-9]+)\).*/\1/')
+    $(ls -tr "$MINT"/var/log/kern.log* 2>/dev/null) 2>/dev/null | tail -1 | sed -E 's/.*\((sd[a-z]+[0-9]+)\).*/\1/' || true)
+# (no match is normal on a long-running Mint whose logs have rotated past its
+#  last boot, e.g. zmc2 at 144 days up; without "|| true" pipefail killed the script)
 for f in "$TARGET/etc/fstab" "$TARGET"/etc/auto.*; do
     [ -f "$f" ] || continue
     for d in $(grep -v '^\s*#' "$f" | grep -oE '/dev/sd[a-z]+[0-9]+' | sort -u); do
         u=$(blkid -o value -s UUID "$d" 2>/dev/null) || u=
-        if [ -z "$u" ] || { [ -n "$mint_seen" ] && [ "/dev/$mint_seen" != "$MINT_DEV" ]; }; then
-            echo "DEVNAME   $f uses $d -- could not map safely to a UUID, fix by hand" >> "$HOSTDIR/etc-review.txt.pre"
+        if [ -z "$u" ] || [ -z "$mint_seen" ] || [ "/dev/$mint_seen" != "$MINT_DEV" ]; then
+            why="no UUID"; [ -n "$u" ] && why="Mint's kern.log doesn't confirm this session names disks as Mint did"
+            echo "DEVNAME   ${f#"$TARGET"} uses $d -- $why; fix by hand" >> "$HOSTDIR/etc-review.txt.pre"
             continue
         fi
         sed -i "s|$d\b|/dev/disk/by-uuid/$u|g" "$f"
