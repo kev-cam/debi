@@ -67,6 +67,30 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
    Without `--reboot` it only prepares the stick. `--grub-entry` adds the
    menu entry without rebooting.
 
+## Before you start: export Firefox bookmarks and history
+
+> **Warning:** on mediapc, Firefox bookmarks and history were lost in Debian.
+
+Mint ships the current Firefox release. Debian 13 ships `firefox-esr`, which
+is an older version. The profile copied with `/home` was written by the
+newer Firefox, so Debian's Firefox doesn't use it, and the user appears to
+start with an empty profile.
+
+For each user, on Mint, before `m2d migrate`:
+
+- **Bookmarks:** Bookmarks → Manage Bookmarks → Import and Backup →
+  **Export Bookmarks to HTML**, or **Backup** for a JSON file. Import the
+  file in Debian's Firefox.
+- **History:** Firefox has no history export. Keep a copy of
+  `places.sqlite` from the profile directory under `~/.mozilla/firefox/`.
+  Better still, sign in to a Firefox account on Mint and let it sync. Debian's
+  Firefox then pulls bookmarks, history and passwords.
+- **Passwords:** Settings → Passwords → ⋯ → **Export passwords** (a CSV
+  file, so delete it after importing).
+
+Mint's own `/home` isn't modified, so the original profile is still there
+under Mint if something was missed.
+
 ## Procedure
 
 In the live session, as root (for example `ssh root@<machine>`; the host key
