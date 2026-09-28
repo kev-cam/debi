@@ -1,0 +1,4 @@
+# per-machine state, logs, package reports and DB dumps (kept on the stick)
+hosts/
+*.log
+wget-log*

@@ -1,0 +1,71 @@
+# Mint/Ubuntu package -> Debian replacement(s), used by m2d-migrate.
+#   <mint-name>  <debian-name[ debian-name...]>  |  -   (drop)
+# Keys containing * or ? are shell globs, tried after exact matches.
+# Names not listed here are tried as-is; if Debian lacks them they end up in
+# hosts/<host>/packages-skipped.txt.  MythTV packages are handled by m2d-mythtv.
+
+# Mint / Ubuntu infrastructure
+mint*                       -
+linuxmint*                  -
+ubuntu-*                    -
+casper                      -
+python3-distupgrade         -
+software-properties-gtk     software-properties-gtk
+systemd-hwe-hwdb            -
+thingy                      -
+bulky                       -
+*-hwe-*                     -
+linux-generic*              -
+linux-image-*               -
+linux-headers-*             -
+linux-modules-*             -
+grub-*                      -
+shim-signed                 -
+
+# Databases: Debian's default MySQL is MariaDB
+mysql-server*               mariadb-server
+mysql-client*               mariadb-client
+default-mysql-server        mariadb-server
+default-mysql-client        mariadb-client
+
+# MythTV family (installed from deb-multimedia by m2d-mythtv)
+myth*                       -
+libmyth*                    -
+php-mythtv                  -
+kodi-pvr-mythtv             kodi-pvr-mythtv
+
+# Renamed / replaced
+firefox                     firefox-esr
+thunderbird                 thunderbird
+openoffice.org-hyphenation  hyphen-en-us
+w-scan                      w-scan-cpp
+ssh                         openssh-client openssh-server
+tightvnc-java               -
+tightvncpasswd              tigervnc-tools
+tightvncserver              tigervnc-standalone-server
+libusb-ocaml*               -
+libusb-java*                -
+libusb3380*                 -
+libusbauth-configparser*    -
+libcephfs2                  -
+librados2                   -
+libgfapi0                   -
+libgfrpc0                   -
+libgfxdr0                   -
+libglusterfs0               -
+libfreerdp-client2-2        -
+libperl5.*                  -
+libpython3.*                -
+libssl3                     -
+libldap-2.5-0               -
+libsoup2.4-common           -
+libjavascriptcoregtk-*      -
+libtinyxml2.6.2v5           -
+libnautilus-extension1a     -
+libreoffice-style-yaru      -
+liblibreoffice-java         -
+mint-*-theme                -
+mint-*-icons                -
+mint-cursor-themes          -
+microsoft-edge*             -
+google-chrome*              -

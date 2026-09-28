@@ -1,0 +1,28 @@
+#!/bin/bash
+# m2d -- mint2deb driver.
+#   m2d status                 show the surveyed host's state and finished steps
+#   m2d all [--yes] [split opts] survey -> split -> install -> migrate -> mythtv -> boot
+#                              (stops after the split plan unless --yes)
+#   m2d <step> [args]          run one step: survey split install migrate mythtv boot
+# Steps are resumable: rerunning 'all' skips finished steps.
+M2D_HOME=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+cmd=${1:-status}; shift || true
+case $cmd in
+    survey|split|install|migrate|mythtv|boot) exec "$M2D_HOME/m2d-$cmd" "$@" ;;
+    status)
+        c=$M2D_HOME/hosts/current
+        [ -e "$c/state.env" ] || { echo "no host surveyed yet (m2d survey)"; exit 0; }
+        echo "host dir: $(readlink -f "$c")"; cat "$c/state.env"
+        echo "done: $(tr '\n' ' ' < "$c/steps.done" 2>/dev/null)" ;;
+    all)
+        set -e
+        "$M2D_HOME/m2d-survey"
+        done_() { grep -qx "$1" "$M2D_HOME/hosts/current/steps.done" 2>/dev/null; }
+        done_ split || "$M2D_HOME/m2d-split" "$@"
+        done_ split || exit 0                       # dry run only
+        for s in install migrate mythtv boot; do
+            done_ $s || "$M2D_HOME/m2d-$s"
+        done
+        echo "all steps done.  Reboot, pick Debian, then check: systemctl status mythtv-backend" ;;
+    *) sed -n '2,8s/^# \{0,1\}//p' "$0"; exit 2 ;;
+esac

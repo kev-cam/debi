@@ -1,0 +1,139 @@
+#!/bin/bash
+# m2d-survey [--root /dev/sdXN]
+# Find the Mint root partition, record everything later steps need into
+# hosts/<hostname>/state.env, and snapshot the Mint system's package/user/etc
+# inventory.  Read-only: mounts Mint ro, changes nothing on disk.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+ROOT=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --root) ROOT=$2; shift 2 ;;
+        *) die "usage: m2d-survey [--root /dev/sdXN]" ;;
+    esac
+done
+
+# The disk the live system booted from must never be a candidate.
+live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || true)
+live_disk=${live_src:+$(lsblk -no PKNAME "$live_src" 2>/dev/null | head -1)}
+
+probe=/mnt/m2d-probe
+if [ -z "$ROOT" ]; then
+    cands=()
+    while read -r name fstype; do
+        [ "$fstype" = ext4 ] || continue
+        pk=$(lsblk -no PKNAME "/dev/$name" | head -1)
+        [ -n "$live_disk" ] && [ "$pk" = "$live_disk" ] && continue
+        mkdir -p $probe
+        if mount -o ro "/dev/$name" $probe 2>/dev/null; then
+            if grep -qsE '^ID=linuxmint' $probe/etc/os-release \
+               || { [ -n "${M2D_ALLOW_UBUNTU:-}" ] && grep -qs '^ID=ubuntu' $probe/etc/os-release; }; then
+                cands+=("/dev/$name")
+            fi
+            umount $probe
+        fi
+    done < <(lsblk -rno NAME,FSTYPE)
+    [ ${#cands[@]} -eq 1 ] || die "found ${#cands[@]} Mint roots (${cands[*]:-none}); pass --root"
+    ROOT=${cands[0]}
+fi
+[ -b "$ROOT" ] || die "$ROOT is not a block device"
+
+mkdir -p $probe
+if ! mountpoint -q $probe; then      # (a pre-existing mount is reused, e.g. for rehearsals)
+    mount -o ro "$ROOT" $probe
+    trap 'umount $probe 2>/dev/null || true' EXIT
+fi
+
+host=$(tr -d ' \n' < $probe/etc/hostname)
+[ -n "$host" ] || die "Mint /etc/hostname is empty"
+HOSTDIR=$M2D_HOME/hosts/$host
+mkdir -p "$HOSTDIR"
+ln -sfn "$host" "$M2D_HOME/hosts/current"
+log "Mint root $ROOT, hostname $host -> $HOSTDIR"
+
+disk=/dev/$(lsblk -no PKNAME "$ROOT" | head -1)
+partn=$(cat "/sys/class/block/$(basename "$ROOT")/partition")
+pttype=$(blkid -o value -s PTTYPE "$disk")
+set_state MINT_DEV "$ROOT"
+set_state MINT_UUID "$(blkid -o value -s UUID "$ROOT")"
+set_state MINT_HOST "$host"
+set_state MINT_NAME "$(. $probe/etc/os-release; echo "$PRETTY_NAME")"
+set_state MINT_EDITION "$(sed -n 's/^EDITION="\?\([^"]*\)"\?/\1/p' $probe/etc/linuxmint/info 2>/dev/null)"
+set_state DISK "$disk"
+set_state MINT_PARTN "$partn"
+set_state PTTYPE "$pttype"
+
+# Separate /boot on Mint?  (Only matters for grub configfile chaining.)
+bootline=$(awk '$1!~/^#/ && $2=="/boot" {print $1}' $probe/etc/fstab)
+case $bootline in
+    "") set_state MINT_BOOT_DEV "" ;;
+    /dev/*) set_state MINT_BOOT_DEV "$bootline" ;;
+    *) set_state MINT_BOOT_DEV "$(findfs "$bootline")" ;;
+esac
+
+# Boot mode is how *Mint* boots, which need not match how the USB was booted.
+dpkg_has() { grep -A1 -x "Package: $1" $probe/var/lib/dpkg/status | grep -c 'Status: install ok installed' >/dev/null; }
+# Mint may have grub-pc AND grub-efi-amd64-signed installed (zmc2 does), so
+# decide by which GRUB platform grub-install last populated in /boot/grub.
+mint_bootdir=$probe/boot; [ -n "$(awk '$1!~/^#/ && $2=="/boot"' $probe/etc/fstab)" ] && mint_bootdir=
+if [ -n "$mint_bootdir" ] && [ -d "$mint_bootdir/grub/x86_64-efi" ] && [ ! -d "$mint_bootdir/grub/i386-pc" ]; then mode=uefi
+elif [ -n "$mint_bootdir" ] && [ -d "$mint_bootdir/grub/i386-pc" ] && [ ! -d "$mint_bootdir/grub/x86_64-efi" ]; then mode=bios
+elif { dpkg_has grub-efi-amd64 || dpkg_has grub-efi-amd64-signed; } && ! dpkg_has grub-pc; then mode=uefi
+else mode=bios; fi
+set_state BOOTMODE "$mode"
+live_mode=bios; [ -d /sys/firmware/efi ] && live_mode=uefi
+[ "$mode" = "$live_mode" ] || warn "Mint boots $mode but this live session booted $live_mode"
+esp=$(awk '$1!~/^#/ && $2=="/boot/efi" {print $1}' $probe/etc/fstab)
+set_state ESP_SPEC "${esp:-}"
+# Firmware boot order before we touch it (m2d-bootctl restore-mint puts it back).
+# Only set on the first survey, so a re-survey after m2d-boot keeps the original.
+if [ "$mode" = uefi ] && [ -d /sys/firmware/efi ] && ! grep -q '^EFI_BOOTORDER_ORIG=' "$HOSTDIR/state.env"; then
+    command -v efibootmgr >/dev/null || die "efibootmgr missing (m2d-prep-usb installs it)"
+    set_state EFI_BOOTORDER_ORIG "$(efibootmgr | sed -n 's/^BootOrder: //p')"
+    efibootmgr -v > "$HOSTDIR/efibootmgr-before.txt" 2>/dev/null || true
+fi
+if [ "$mode" = bios ] && [ "$pttype" = gpt ]; then
+    sfdisk -d "$disk" | grep -ci 21686148-6449-6E6F-744E-656564454649 >/dev/null \
+        || warn "GPT disk booting BIOS but no bios_grub partition found"
+fi
+
+# Sizes (MiB)
+ss=$(blockdev --getss "$disk")
+psize=$(( $(blockdev --getsize64 "$ROOT") / 1048576 ))
+used=$(df -m --output=used $probe | tail -1 | tr -d ' ')
+set_state MINT_PART_MIB "$psize"
+set_state MINT_USED_MIB "$used"
+set_state SECTOR_SIZE "$ss"
+
+# ---- inventory -----------------------------------------------------------
+st=$probe/var/lib/dpkg/status
+awk '/^Package:/{p=$2} /^Status: install ok installed/{print p}' $st | sort -u > "$HOSTDIR/mint-installed.txt"
+# apt-mark showmanual equivalent: installed minus auto-installed
+awk '/^Package:/{p=$2} /^Auto-Installed: 1/{print p}' $probe/var/lib/apt/extended_states | sort -u > "$HOSTDIR/.auto"
+comm -23 "$HOSTDIR/mint-installed.txt" "$HOSTDIR/.auto" > "$HOSTDIR/mint-manual.txt"
+if [ -f $probe/var/log/installer/initial-status.gz ]; then
+    gzip -dc $probe/var/log/installer/initial-status.gz | sed -n 's/^Package: //p' | sort -u > "$HOSTDIR/.initial"
+    comm -23 "$HOSTDIR/mint-manual.txt" "$HOSTDIR/.initial" > "$HOSTDIR/mint-user-added.txt"
+else
+    cp "$HOSTDIR/mint-manual.txt" "$HOSTDIR/mint-user-added.txt"
+fi
+rm -f "$HOSTDIR/.auto" "$HOSTDIR/.initial"
+awk -F: '$3>=1000 && $3<60000' $probe/etc/passwd > "$HOSTDIR/mint-users.txt"
+grep -h '^deb ' $probe/etc/apt/sources.list.d/*.list 2>/dev/null | grep -vE 'linuxmint|ubuntu.com' > "$HOSTDIR/mint-thirdparty-repos.txt" || true
+cp $probe/etc/fstab "$HOSTDIR/mint-fstab"
+
+myth=no; grep -qxE 'mythtv-(backend|frontend)' "$HOSTDIR/mint-installed.txt" && myth=yes
+set_state HAS_MYTHTV "$myth"
+
+cat <<EOF
+
+  host        $host  ($(. "$HOSTDIR/state.env"; echo "$MINT_NAME, $MINT_EDITION"))
+  mint root   $ROOT  (partition $partn on $disk, $pttype, boots $mode)
+  size        ${psize} MiB, ${used} MiB used
+  packages    $(wc -l < "$HOSTDIR/mint-installed.txt") installed, $(wc -l < "$HOSTDIR/mint-user-added.txt") added by the user
+  users       $(cut -d: -f1 "$HOSTDIR/mint-users.txt" | tr '\n' ' ')
+  mythtv      $myth
+  3rd-party   $(wc -l < "$HOSTDIR/mint-thirdparty-repos.txt") repos (listed, not migrated)
+
+Next: m2d-split   (prints the proposed split; add --yes to do it)
+EOF

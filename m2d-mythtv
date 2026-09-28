@@ -1,0 +1,219 @@
+#!/bin/bash
+# m2d-mythtv [--no-db]
+# MythTV on the new Debian root, as an INDEPENDENT copy of Mint's setup:
+#   * deb-multimedia repo (pinned: only MythTV + its libs come from there)
+#   * the same MythTV components Mint had, plus MariaDB
+#   * a one-time copy of Mint's mythconverg (dumped by running Mint's own
+#     mysqld in a chroot).  MythTV 35 upgrades the schema on first backend
+#     start; Mint's DB is left untouched.
+#   * config.xml, mythtv group membership, recording-mount uid/gid remap,
+#     local storage-group dirs on the Mint root bound into Debian.
+# Recordings on shared disks stay shared; the two DBs diverge from here on.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+load_state
+[ "$HAS_MYTHTV" = yes ] || { log "Mint has no MythTV -- nothing to do"; mark_done mythtv; exit 0; }
+NODB=; [ "${1:-}" = --no-db ] && NODB=1
+sed -i '/^mythtv: /d' "$HOSTDIR/packages-skipped.txt" 2>/dev/null || true
+mount_mint rw          # rw: Mint's mysqld must be able to start
+target_setup
+
+# ---- deb-multimedia ---------------------------------------------------------
+if [ ! -f "$TARGET/usr/share/keyrings/deb-multimedia-keyring.pgp" ] && \
+   [ ! -f "$TARGET/usr/share/keyrings/deb-multimedia-keyring.gpg" ]; then
+    kr=$(curl -fsL https://www.deb-multimedia.org/pool/main/d/deb-multimedia-keyring/ \
+         | grep -o 'deb-multimedia-keyring_[^"]*_all\.deb' | sort -V | tail -1)
+    [ -n "$kr" ] || die "cannot find deb-multimedia-keyring on www.deb-multimedia.org"
+    curl -fsL -o "$TARGET/tmp/$kr" "https://www.deb-multimedia.org/pool/main/d/deb-multimedia-keyring/$kr"
+    in_target dpkg -i "/tmp/$kr"
+fi
+krf=$(ls "$TARGET"/usr/share/keyrings/deb-multimedia-keyring.* | head -1)
+cat > "$TARGET/etc/apt/sources.list.d/dmo.sources" <<EOF
+Types: deb
+URIs: https://www.deb-multimedia.org
+Suites: $M2D_SUITE
+Components: main non-free
+Signed-By: ${krf#"$TARGET"}
+EOF
+write_pin() {   # write_pin extra-pkg...
+    {
+        echo "# deb-multimedia would replace half of Debian's media stack if allowed to."
+        echo "# Only MythTV and the dmo builds it hard-depends on come from there"
+        echo "# (the extra names were found by m2d-mythtv from apt's complaints)."
+        echo "Package: *"
+        echo "Pin: release o=Unofficial Multimedia Packages"
+        echo "Pin-Priority: 100"
+        echo
+        echo "Package: *myth* deb-multimedia-keyring $*"
+        echo "Pin: release o=Unofficial Multimedia Packages"
+        echo "Pin-Priority: 500"
+    } > "$TARGET/etc/apt/preferences.d/dmo"
+}
+write_pin
+tapt update
+
+# ---- packages -----------------------------------------------------------------
+tapt install mariadb-server mariadb-client
+start_mariadb() {
+    in_target mariadb-admin ping >/dev/null 2>&1 && return 0
+    mkdir -p "$TARGET/run/mysqld"; in_target chown mysql:mysql /run/mysqld
+    in_target sh -c 'mariadbd --user=mysql --skip-networking --socket=/run/mysqld/mysqld.sock >/tmp/m2d-mariadb.log 2>&1 &'
+    for _ in $(seq 60); do in_target mariadb-admin ping >/dev/null 2>&1 && return 0; sleep 1; done
+    cat "$TARGET/tmp/m2d-mariadb.log"; die "MariaDB did not start in target"
+}
+trap 'in_target mariadb-admin shutdown >/dev/null 2>&1 || true; cleanup_mounts' EXIT
+start_mariadb       # mythtv-database's postinst talks to it
+# Without tz tables mythbackend 35 starts in "Web App only" setup mode and
+# never upgrades the schema.
+[ "$(in_target mariadb -N -e 'select count(*) from mysql.time_zone_name')" -gt 0 ] || \
+    in_target sh -c 'mariadb-tzinfo-to-sql /usr/share/zoneinfo 2>/dev/null | mariadb mysql'
+
+mi=$HOSTDIR/mint-installed.txt
+pkgs=()
+# Ubuntu/mythbuntu name -> dmo name
+while read -r ub dm; do
+    grep -qx "$ub" "$mi" && pkgs+=("$dm")
+done <<'MAP'
+mythtv-backend          mythtv-backend
+mythtv-frontend         mythtv-frontend
+mythtv-common           mythtv-common
+mythtv-database         mythtv-database
+mythtv-transcode-utils  mythtv-transcode
+libmyth-python          python3-mythtv
+libmythtv-perl          libmythtv-perl
+mythweb                 mythweb
+php-mythtv              php-mythtv
+mythtv-status           mythtv-status
+kodi-pvr-mythtv         kodi-pvr-mythtv
+mythmusic               mythmusic
+mythgame                mythgame
+mythnews                mythnews
+mythweather             mythweather
+mytharchive             mytharchive
+mythzoneminder          mythzoneminder
+xmltv                   xmltv
+xmltv-util              xmltv-util
+MAP
+grep -qx xmltv "$mi" || grep -qx xmltv-util "$mi" || pkgs+=(xmltv-util)
+grep -qx mythtv-backend "$mi" && pkgs+=(mythtv-database)
+mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | sort -u)
+
+# Grow the dmo pin until apt can resolve: dmo's MythTV hard-depends on dmo
+# builds (epoch-bumped libass9, libbluray2, ...) of some Debian libraries.
+# apt only names the first broken link, so recurse through
+# "... but it is not going to be installed" to the real version conflicts.
+extra=()
+probe() {   # probe pkg depth -> appends dmo packages to pin to $extra
+    local out d
+    out=$(in_target apt-get -s install "$1" 2>&1) && return 0
+    # classic solver: "Depends: libass9 (>= 2:0.17.4) but 1:0.17.3 is to be installed"
+    # apt 3 solver:   "libass9:amd64=2:0.17.4-dmo1+deb13u1 is not selected for install"
+    for d in $( { grep -oE 'Depends: [a-z0-9.+-]+ \([^)]*\) but [^ ]+ is to be installed' <<<"$out" | awk '{print $2}'
+                  grep -oE '[a-z0-9.+-]+:[a-z0-9]+=[^ ]*dmo[^ ]*' <<<"$out" | cut -d: -f1; } | grep -v myth | sort -u); do
+        [[ " ${extra[*]} " == *" $d "* ]] && continue
+        in_target apt-cache policy "$d" 2>/dev/null | grep -c deb-multimedia >/dev/null && { extra+=("$d"); write_pin "${extra[@]}"; }
+    done
+    [ "$2" -lt 4 ] || return 0
+    for d in $(grep -oE 'Depends: [a-z0-9.+-]+( \([^)]*\))? but it is not (going to be|installable)' <<<"$out" | awk '{print $2}' | sort -u); do
+        probe "$d" $(( $2 + 1 ))
+    done
+}
+for _ in 1 2 3 4 5; do
+    in_target apt-get -s install "${pkgs[@]}" >/dev/null 2>&1 && break
+    n=${#extra[@]}
+    for p in "${pkgs[@]}"; do probe "$p" 0; done
+    [ ${#extra[@]} -gt "$n" ] || break
+done
+printf '%s\n' "${extra[@]}" > "$HOSTDIR/dmo-pinned-extra.txt"
+log "dmo pin: *myth* + ${#extra[@]} dependency packages: ${extra[*]}"
+install_best_effort mythtv "${pkgs[@]}"
+in_target dpkg -s mythtv-common >/dev/null 2>&1 || die "MythTV did not install (see $HOSTDIR/packages-skipped.txt)"
+
+# ---- config.xml + groups ------------------------------------------------------------
+[ -f "$MINT/etc/mythtv/config.xml" ] && cp -a "$MINT/etc/mythtv/config.xml" "$TARGET/etc/mythtv/config.xml"
+in_target chown mythtv:mythtv /etc/mythtv/config.xml 2>/dev/null || true
+for u in $(awk -F: '$1=="mythtv"{gsub(","," ",$4); print $4}' "$MINT/etc/group"); do
+    in_target id "$u" >/dev/null 2>&1 && in_target usermod -aG mythtv "$u"
+done
+
+# Mount options that name Mint's numeric mythtv uid/gid -> Debian's.
+muid=$(awk -F: '$1=="mythtv"{print $3}' "$MINT/etc/passwd"); mgid=$(awk -F: '$1=="mythtv"{print $3}' "$MINT/etc/group")
+duid=$(in_target id -u mythtv); dgid=$(in_target getent group mythtv | cut -d: -f3)
+if [ -n "$muid" ] && [ "$muid:$mgid" != "$duid:$dgid" ]; then
+    for f in "$TARGET"/etc/fstab "$TARGET"/etc/auto.*; do
+        [ -f "$f" ] || continue
+        sed -i -E "s/\buid=$muid\b/uid=$duid/g; s/\bgid=$mgid\b/gid=$dgid/g" "$f"
+    done
+    log "remapped mythtv uid/gid $muid:$mgid -> $duid:$dgid in fstab/autofs maps"
+fi
+
+# ---- database -------------------------------------------------------------------------
+dbhost=$(sed -n 's:.*<Host>\(.*\)</Host>.*:\1:p' "$MINT/etc/mythtv/config.xml" | head -1)
+dbuser=$(sed -n 's:.*<UserName>\(.*\)</UserName>.*:\1:p' "$MINT/etc/mythtv/config.xml" | head -1)
+dbpass=$(sed -n 's:.*<Password>\(.*\)</Password>.*:\1:p' "$MINT/etc/mythtv/config.xml" | head -1)
+dbname=$(sed -n 's:.*<DatabaseName>\(.*\)</DatabaseName>.*:\1:p' "$MINT/etc/mythtv/config.xml" | head -1)
+dump=$HOSTDIR/mythconverg-from-mint.sql.gz
+if [ -n "$NODB" ]; then log "--no-db: leaving the Debian DB as installed"
+elif [ "$dbhost" != localhost ] && [ "$dbhost" != 127.0.0.1 ]; then
+    log "Mint's DB lives on $dbhost -- frontend/slave setup, nothing to copy"
+else
+    if [ ! -s "$dump" ]; then
+        log "dumping $dbname from Mint's own database server (chroot)"
+        chroot_mounts "$MINT"
+        sock=/tmp/m2d-mint-mysqld.sock
+        # /var/run is an absolute symlink to /run: use the chroot's /run tmpfs
+        mkdir -p "$MINT/run/mysqld"; in_mint chown mysql:mysql /run/mysqld
+        in_mint sh -c "mysqld --user=mysql --skip-networking --socket=$sock --pid-file=/tmp/m2d-mysqld.pid >/tmp/m2d-mysqld.log 2>&1 &"
+        for _ in $(seq 60); do in_mint mysqladmin -S $sock ping >/dev/null 2>&1 && break; sleep 1; done
+        in_mint mysqladmin -S $sock ping >/dev/null 2>&1 || { cat "$MINT/tmp/m2d-mysqld.log"; die "Mint mysqld did not start"; }
+        in_mint mysqldump -S $sock --single-transaction --routines --triggers --no-tablespaces \
+            --default-character-set=utf8mb4 --databases "$dbname" | gzip > "$dump.tmp"
+        in_mint mysqladmin -S $sock shutdown
+        mv "$dump.tmp" "$dump"
+        log "dump: $(du -h "$dump" | cut -f1)"
+    fi
+    log "loading dump into Debian's MariaDB (chroot)"
+    start_mariadb
+    in_target mariadb -e "DROP DATABASE IF EXISTS \`$dbname\`"
+    # MySQL 8 collations MariaDB may not know
+    gzip -dc "$dump" | sed -e 's/utf8mb4_0900_ai_ci/utf8mb4_unicode_ci/g' -e 's/utf8mb4_0900_as_cs/utf8mb4_bin/g' \
+        | in_target mariadb --default-character-set=utf8mb4
+    in_target mariadb -e "
+        CREATE USER IF NOT EXISTS '$dbuser'@'localhost' IDENTIFIED BY '$dbpass';
+        ALTER USER '$dbuser'@'localhost' IDENTIFIED BY '$dbpass';
+        CREATE USER IF NOT EXISTS '$dbuser'@'%' IDENTIFIED BY '$dbpass';
+        ALTER USER '$dbuser'@'%' IDENTIFIED BY '$dbpass';
+        GRANT ALL ON \`$dbname\`.* TO '$dbuser'@'localhost';
+        GRANT ALL ON \`$dbname\`.* TO '$dbuser'@'%';
+        FLUSH PRIVILEGES;"
+    n=$(in_target mariadb -N -e "select count(*) from \`$dbname\`.recorded")
+    log "imported: $n recordings in $dbname"
+    set_state MYTH_RECORDED_AT_COPY "$n"
+
+    # Storage-group dirs that lived on the Mint root itself (not on another
+    # mount and not under /home, which was copied): bind them from Mint.
+    : > "$HOSTDIR/.sgdirs"
+    gzip -dc "$dump" | grep -o "INSERT INTO \`storagegroup\` VALUES .*" \
+        | grep -oE "'/[^']*'" | tr -d "'" | sort -u > "$HOSTDIR/.sgdirs" || true
+    mounts=$(awk '$1!~/^#/ {print $2}' "$MINT/etc/fstab"; \
+             awk '$1!~/^#/ && $1 ~ /^\// {print $1}' "$MINT/etc/auto.master" 2>/dev/null)
+    while read -r d; do
+        case $d in /home/*|/mnt/m2d*) continue ;; esac
+        onother=
+        for m in $mounts; do [ "$m" != / ] && case $d in "${m%/}"/*|"$m") onother=1 ;; esac; done
+        [ -n "$onother" ] && continue
+        [ -d "$MINT$d" ] || continue
+        grep -q '/mnt/mint ' "$TARGET/etc/fstab" || \
+            echo "UUID=$MINT_UUID  /mnt/mint  ext4  defaults,nofail  0  2" >> "$TARGET/etc/fstab"
+        mkdir -p "$TARGET/mnt/mint" "$TARGET$d"
+        e=$(printf '%s' "${d%/}" | sed 's/ /\\040/g')    # fstab escapes spaces
+        echo "/mnt/mint$e  $e  none  bind,nofail,x-systemd.requires-mounts-for=/mnt/mint  0  0" >> "$TARGET/etc/fstab"
+        log "storage group dir $d is on the Mint root -> bind-mounted from /mnt/mint"
+    done < "$HOSTDIR/.sgdirs"
+fi
+
+in_target systemctl enable mythtv-backend.service mariadb.service >/dev/null 2>&1 || true
+in_target mariadb-admin shutdown >/dev/null 2>&1 || true
+target_teardown
+mark_done mythtv
+log "MythTV prepared.  The schema upgrade (Mint's v$(gzip -dc "$dump" 2>/dev/null | grep -o "'DBSchemaVer','[0-9]*'" | grep -o '[0-9]*' | head -1) -> 35) runs on first mythbackend start."
+log "Next: m2d-boot"

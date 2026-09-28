@@ -1,0 +1,206 @@
+#!/bin/bash
+# m2d-migrate [--no-home]
+# Carry the Mint system's identity over to the new Debian root:
+#   users/groups/passwords, /home (copied, minus caches), ssh host keys,
+#   network connections, a curated set of /etc config, /usr/local, crontabs,
+#   bluetooth pairings, tuner/v4l firmware, the user-installed package set
+#   (mapped via pkgmap.txt) and the enabled services that exist on Debian.
+# Anything not copied automatically is listed in hosts/<host>/etc-review.txt.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+load_state
+HOME_COPY=1
+[ "${1:-}" = --no-home ] && HOME_COPY=
+mount_mint ro
+target_setup
+
+# ---- users & groups -----------------------------------------------------------
+log "users and groups"
+mint_users=$(awk -F: '$3>=1000 && $3<60000 {print $1}' "$MINT/etc/passwd")
+while IFS=: read -r g _ gid _; do                  # user-range groups, same GID
+    [ "$gid" -ge 1000 ] && [ "$gid" -lt 60000 ] || continue
+    getent -s files group "$g" >/dev/null 2>&1 && continue
+    in_target groupadd -g "$gid" "$g" 2>/dev/null || in_target groupadd "$g"
+done < "$MINT/etc/group"
+for u in $mint_users; do
+    IFS=: read -r _ _ uid gid gecos home shell < <(grep "^$u:" "$MINT/etc/passwd")
+    in_target test -x "$shell" || shell=/bin/bash
+    if ! in_target id "$u" >/dev/null 2>&1; then
+        in_target useradd -M -u "$uid" -g "$gid" -c "$gecos" -d "$home" -s "$shell" "$u"
+    fi
+    hash=$(grep "^$u:" "$MINT/etc/shadow" | cut -d: -f2)
+    in_target usermod -p "$hash" "$u"
+    # supplementary groups that also exist on Debian (mythtv etc. re-added later)
+    for g in $(awk -F: -v u="$u" '{n=split($4,m,","); for(i=1;i<=n;i++) if(m[i]==u) print $1}' "$MINT/etc/group"); do
+        in_target getent group "$g" >/dev/null && in_target usermod -aG "$g" "$u" || true
+    done
+    in_target usermod -aG audio,video,plugdev,netdev,bluetooth "$u" 2>/dev/null || true
+done
+roothash=$(grep '^root:' "$MINT/etc/shadow" | cut -d: -f2)
+[ -n "$roothash" ] && in_target usermod -p "$roothash" root
+echo "$mint_users" > "$HOSTDIR/.migrated-users"
+
+# ---- home -------------------------------------------------------------------
+if [ -n "$HOME_COPY" ]; then
+    log "copying /home (excluding caches and trash)"
+    rsync -aHAX --numeric-ids --info=stats1 \
+        --exclude='/*/.cache/' --exclude='/*/.local/share/Trash/' \
+        --exclude='/*/.thumbnails/' "$MINT/home/" "$TARGET/home/"
+fi
+rsync -a "$MINT/root/.ssh" "$TARGET/root/" 2>/dev/null || true
+for f in .bashrc .profile .tcshrc .cshrc .emacs; do
+    [ -f "$MINT/root/$f" ] && cp -a "$MINT/root/$f" "$TARGET/root/"
+done
+
+# ---- /etc -------------------------------------------------------------------
+log "copying curated /etc config"
+copy_etc() {   # copy_etc path...  (relative to /etc; globs allowed)
+    local p
+    for p in "$@"; do
+        for src in "$MINT"/etc/$p; do
+            [ -e "$src" ] || continue
+            rel=${src#"$MINT"/}
+            mkdir -p "$TARGET/$(dirname "$rel")"
+            cp -a "$src" "$TARGET/$rel"
+            echo "/$rel" >> "$HOSTDIR/etc-copied.txt"
+        done
+    done
+}
+: > "$HOSTDIR/etc-copied.txt"; : > "$HOSTDIR/etc-review.txt.pre"
+copy_etc 'ssh/ssh_host_*' 'ssh/sshd_config.d/*' 'ssh/ssh_config.d/*' \
+    'NetworkManager/system-connections/*' \
+    auto.master 'auto.master.d' 'auto.*' credentials.txt '*.credentials' \
+    exports samba/smb.conf yp.conf defaultdomain LCDd.conf \
+    'modprobe.d/*' 'modules-load.d/*' 'udev/rules.d/*' 'X11/xorg.conf' 'X11/xorg.conf.d/*' \
+    'lightdm/lightdm.conf' 'lightdm/lightdm.conf.d/*' 'lightdm/slick-greeter.conf' \
+    'sudoers.d/*' 'cups/printers.conf' 'cups/ppd' 'openvpn/*' 'wireguard/*' \
+    'ssmtp/*' 'msmtprc' 'aliases' 'environment' 'sysctl.d/*' 'hosts.allow' 'hosts.deny'
+# /dev/sdXN names are not stable (Debian enumerated mediapc's disks in the
+# opposite order to Mint).  Rewrite them to by-uuid using this live session's
+# view, which matches Mint's only if Mint's root has the same name here as in
+# Mint's own kernel log -- otherwise leave them and shout.
+# (6.x kernels log the UUID on mount; 5.x only "re-mounted ... errors=remount-ro" for /)
+mint_seen=$(zgrep -ahoE "EXT4-fs \(sd[a-z]+[0-9]+\): (mounted filesystem $MINT_UUID|re-mounted. Opts: errors=remount-ro)" \
+    $(ls -tr "$MINT"/var/log/kern.log* 2>/dev/null) 2>/dev/null | tail -1 | sed -E 's/.*\((sd[a-z]+[0-9]+)\).*/\1/')
+for f in "$TARGET/etc/fstab" "$TARGET"/etc/auto.*; do
+    [ -f "$f" ] || continue
+    for d in $(grep -v '^\s*#' "$f" | grep -oE '/dev/sd[a-z]+[0-9]+' | sort -u); do
+        u=$(blkid -o value -s UUID "$d" 2>/dev/null) || u=
+        if [ -z "$u" ] || { [ -n "$mint_seen" ] && [ "/dev/$mint_seen" != "$MINT_DEV" ]; }; then
+            echo "DEVNAME   $f uses $d -- could not map safely to a UUID, fix by hand" >> "$HOSTDIR/etc-review.txt.pre"
+            continue
+        fi
+        sed -i "s|$d\b|/dev/disk/by-uuid/$u|g" "$f"
+        echo "devname: ${f#"$TARGET"} $d -> by-uuid/$u ($(blkid -o value -s LABEL "$d" 2>/dev/null))" >> "$HOSTDIR/etc-copied.txt"
+    done
+done
+# OpenSSH 10 (trixie) has no DSA at all; "+ssh-dss" makes the whole config fatal.
+for f in "$TARGET"/root/.ssh/config "$TARGET"/home/*/.ssh/config "$TARGET"/etc/ssh/ssh_config.d/*; do
+    [ -f "$f" ] && grep -qiE '\+?ssh-dss' "$f" || continue
+    cp -a "$f" "$f.m2d-orig"
+    sed -i -E '/^\s*(HostkeyAlgorithms|PubkeyAcceptedKeyTypes|PubkeyAcceptedAlgorithms)\s+\+ssh-dss\s*$/Id; s/,?\+?ssh-dss//Ig' "$f"
+    echo "SSH-DSA   ${f#"$TARGET"}: removed ssh-dss (hosts needing it are unreachable from Debian's OpenSSH 10)" >> "$HOSTDIR/etc-review.txt.pre"
+done
+# iMON LCD: the kernel's device number differs between kernels; udev gives a stable link
+grep -qsE '^Driver\s*=\s*imonlcd' "$TARGET/etc/LCDd.conf" && sed -i -E 's|^(Device\s*=\s*)/dev/lcd[0-9]+|\1/dev/lcd-imon|' "$TARGET/etc/LCDd.conf"
+
+# Mint-only bits that would break or confuse Debian
+rm -f "$TARGET"/etc/sudoers.d/mint* "$TARGET"/etc/lightdm/lightdm.conf.d/*linuxmint* \
+      "$TARGET/etc/auto.master.d/"*.dpkg-* 2>/dev/null || true
+chmod 600 "$TARGET"/etc/NetworkManager/system-connections/* 2>/dev/null || true
+chmod 440 "$TARGET"/etc/sudoers.d/* 2>/dev/null || true
+# Mint's 70-linuxmint.conf set the default session; keep the edition's session.
+if ! grep -rqs '^user-session' "$TARGET/etc/lightdm/lightdm.conf" "$TARGET"/etc/lightdm/lightdm.conf.d/; then
+    case ${MINT_EDITION,,} in *mate*) s=mate ;; *xfce*) s=xfce ;; *) s=cinnamon ;; esac
+    mkdir -p "$TARGET/etc/lightdm/lightdm.conf.d"
+    printf '[Seat:*]\nuser-session=%s\n' "$s" > "$TARGET/etc/lightdm/lightdm.conf.d/60-m2d-session.conf"
+fi
+# NIS netgroup line (the ypbind service itself comes with the nis package)
+if grep -qE '^netgroup:.*nis' "$MINT/etc/nsswitch.conf"; then
+    sed -i "s/^netgroup:.*/$(grep '^netgroup:' "$MINT/etc/nsswitch.conf")/" "$TARGET/etc/nsswitch.conf"
+fi
+
+# ---- /usr/local (minus files that belong to Mint packages) -------------------
+log "copying /usr/local"
+for d in bin sbin etc lib share; do
+    [ -d "$MINT/usr/local/$d" ] || continue
+    find "$MINT/usr/local/$d" -type f -o -type l | while read -r f; do
+        rel=${f#"$MINT"}
+        in_mint dpkg -S "$rel" >/dev/null 2>&1 && continue     # e.g. Mint's apt/yelp wrappers
+        mkdir -p "$TARGET$(dirname "$rel")"
+        cp -a "$f" "$TARGET$rel"
+    done
+done
+
+# ---- /var state ---------------------------------------------------------------
+[ -d "$MINT/var/spool/cron/crontabs" ] && rsync -a "$MINT/var/spool/cron/crontabs/" "$TARGET/var/spool/cron/crontabs/"
+[ -d "$MINT/var/lib/bluetooth" ] && rsync -a "$MINT/var/lib/bluetooth/" "$TARGET/var/lib/bluetooth/"
+[ -f "$MINT/var/lib/samba/private/passdb.tdb" ] && {
+    mkdir -p "$TARGET/var/lib/samba/private"; cp -a "$MINT/var/lib/samba/private/passdb.tdb" "$TARGET/var/lib/samba/private/"; }
+
+# ---- packages -------------------------------------------------------------------
+log "mapping Mint's user-installed packages"
+: > "$HOSTDIR/packages-skipped.txt"
+map=$M2D_HOME/pkgmap.txt
+want=()
+while read -r p; do
+    [ -n "$p" ] || continue
+    m=$(awk -v p="$p" '$1!~/^#/ && $1==p {print $2; exit}' "$map")
+    if [ -z "$m" ]; then          # glob rules: lines whose key contains * or ?
+        while read -r pat to; do
+            # shellcheck disable=SC2053
+            [[ $p == $pat ]] && { m=$to; break; }
+        done < <(awk '$1!~/^#/ && $1~/[*?]/' "$map")
+    fi
+    case $m in
+        -) echo "mapped-out: $p" >> "$HOSTDIR/packages-skipped.txt" ;;
+        "") want+=("$p") ;;
+        *) want+=($m) ;;
+    esac
+done < "$HOSTDIR/mint-user-added.txt"
+mapfile -t want < <(printf '%s\n' "${want[@]}" | sort -u)
+install_best_effort user "${want[@]}"
+
+# ---- firmware the Debian packages lack (tuners, capture cards) --------------------
+for d in "$MINT/lib/firmware" "$MINT/usr/lib/firmware"; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 1 -type f \( -name 'dvb-*' -o -name 'v4l-*' \) | while read -r f; do
+        b=$(basename "$f")
+        [ -e "$TARGET/lib/firmware/$b" ] || [ -e "$TARGET/lib/firmware/$b.xz" ] || [ -e "$TARGET/lib/firmware/$b.zst" ] \
+            || { cp -a "$f" "$TARGET/lib/firmware/"; echo "firmware: $b" >> "$HOSTDIR/etc-copied.txt"; }
+    done
+done
+
+# ---- services ---------------------------------------------------------------------
+log "enabling services that were enabled on Mint"
+mint_enabled=$(find "$MINT/etc/systemd/system" -path '*.wants/*' -printf '%f\n' | sort -u)
+skip='^(apport|whoopsie|casper|ubuntu|ua-|mint|gpu-manager|secureboot|dns-clean|kerneloops|motd-news|update-notifier|systemd-|getty@|apparmor|snapd|resolvconf|networkd-dispatcher|dbus|display-manager|samba-ad-dc)'
+for u in $mint_enabled; do
+    grep -qE "$skip" <<<"$u" && continue
+    if in_target systemctl cat "$u" >/dev/null 2>&1; then
+        in_target systemctl enable "$u" >/dev/null 2>&1 && echo "service: $u" >> "$HOSTDIR/etc-copied.txt" || true
+    fi
+done
+
+# ---- review list: /etc files Mint changed that were NOT copied ---------------------
+{
+    echo "# /etc files on Mint that are modified conffiles or not owned by any package,"
+    echo "# and were not migrated automatically.  Review by hand."
+    in_mint dpkg-query -W -f='${Conffiles}\n' 2>/dev/null | awk 'NF>=2 {print $1, $2}' | while read -r f sum; do
+        [ -f "$MINT$f" ] || continue
+        [ "$(md5sum < "$MINT$f" | cut -d' ' -f1)" = "$sum" ] && continue
+        grep -qx "$f" "$HOSTDIR/etc-copied.txt" || echo "modified  $f"
+    done
+    find "$MINT/etc" -type f -newer "$MINT/var/log/installer" 2>/dev/null | sed "s|^$MINT||" | while read -r f; do
+        grep -qx "$f" "$HOSTDIR/etc-copied.txt" && continue
+        in_mint dpkg -S "$f" >/dev/null 2>&1 || echo "unowned   $f"
+    done
+} 2>/dev/null | grep -vE ' /etc/((g)?shadow|passwd|group|sub[ug]id|shells|timezone|machine-id|casper\.conf|default/grub|console-setup/|apparmor\.d/|resolvconf/|profile\.d/debuginfod|perl/XML|dictionaries-common/)|~$|\.O$|\.ucf-dist$|\.dpkg-' \
+  > "$HOSTDIR/etc-review.txt" || true
+# problems found above go to the top of the review list
+cat "$HOSTDIR/etc-review.txt.pre" "$HOSTDIR/etc-review.txt" > "$HOSTDIR/.review" && mv "$HOSTDIR/.review" "$HOSTDIR/etc-review.txt"
+rm -f "$HOSTDIR/etc-review.txt.pre"
+
+target_teardown
+mark_done migrate
+log "migration done. Skipped packages: $HOSTDIR/packages-skipped.txt ; review: $HOSTDIR/etc-review.txt"
+log "Next: m2d-mythtv (if MythTV) then m2d-boot"

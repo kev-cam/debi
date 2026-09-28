@@ -1,0 +1,50 @@
+#!/bin/sh
+# m2d-bootctl -- pick which OS the dual-boot (installed by mint2deb) starts.
+#   m2d-bootctl next    mint|debian   boot that OS once, on the next reboot
+#   m2d-bootctl default mint|debian   make it the default
+#   m2d-bootctl show                  print the GRUB environment
+#   m2d-bootctl restore-mint          (run on Mint) give the disk back to Mint's GRUB
+#                                     (UEFI: restore the pre-mint2deb firmware BootOrder)
+# Works from either system: it edits the grubenv of Debian's GRUB, which owns
+# the boot path.
+set -e
+DEB_UUID=@DEB_UUID@
+MINT_UUID=@MINT_UUID@
+DISK=@DISK@
+BOOTMODE=@BOOTMODE@
+EFI_BOOTORDER_ORIG=@EFI_BOOTORDER_ORIG@
+[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+
+debroot=/
+if [ "$(findmnt -no UUID /)" != "$DEB_UUID" ]; then
+    debroot=$(mktemp -d)
+    mount UUID="$DEB_UUID" "$debroot"
+    trap 'umount "$debroot"; rmdir "$debroot"' EXIT
+fi
+env=$debroot/boot/grub/grubenv
+entry() {
+    case $1 in
+        mint)   echo m2d-mint ;;
+        debian) echo "gnulinux-simple-$DEB_UUID" ;;
+        *) echo "unknown OS '$1' (mint|debian)" >&2; exit 2 ;;
+    esac
+}
+case $1 in
+    next)    grub-editenv "$env" set next_entry="$(entry "$2")"; echo "next boot: $2" ;;
+    default) grub-editenv "$env" set saved_entry="$(entry "$2")"; echo "default: $2" ;;
+    show)    grub-editenv "$env" list ;;
+    restore-mint)
+        [ "$(findmnt -no UUID /)" = "$MINT_UUID" ] || { echo "run this on Mint" >&2; exit 1; }
+        if [ "$BOOTMODE" = uefi ]; then
+            # Debian's GRUB lives in EFI/debian; handing back = the old firmware order.
+            [ -n "$EFI_BOOTORDER_ORIG" ] || { echo "original BootOrder unknown; use efibootmgr -o" >&2; exit 1; }
+            efibootmgr -q -o "$EFI_BOOTORDER_ORIG"
+            echo "firmware BootOrder restored to $EFI_BOOTORDER_ORIG (Debian keeps its own EFI entry)"
+            exit 0
+        fi
+        echo "grub-pc grub-pc/install_devices multiselect $DISK" | debconf-set-selections
+        echo "grub-pc grub-pc/install_devices_empty boolean false" | debconf-set-selections
+        grub-install "$DISK" && update-grub
+        echo "Mint's GRUB owns $DISK again (Debian is reachable from its menu)" ;;
+    *) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 2 ;;
+esac

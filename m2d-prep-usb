@@ -1,0 +1,130 @@
+#!/bin/bash
+# m2d-prep-usb [--keys FILE] [--grub-entry] [--reboot]
+# Run on an EXISTING Linux system (e.g. the Mint machine to be upgraded) with
+# the Debian live USB plugged in.  It prepares the stick's persistence so the
+# live session is remotely usable:
+#   * installs openssh-server, debootstrap, gdisk, efibootmgr into the persistence overlay
+#     (the same <persistence>/rw overlay live-boot uses for "/ union")
+#   * root's authorized_keys (default: this host's /root/.ssh/authorized_keys)
+#   * copies the mint2deb toolkit to /opt/mint2deb
+# --grub-entry  adds a "Debian Live USB (persistence)" entry to THIS host's GRUB
+# --reboot      one-shot boots that entry now (implies --grub-entry)
+set -euo pipefail
+SRC=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+KEYS=/root/.ssh/authorized_keys GRUBENT= REBOOT=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --keys) KEYS=$2; shift 2 ;;
+        --grub-entry) GRUBENT=1; shift ;;
+        --reboot) GRUBENT=1 REBOOT=1; shift ;;
+        *) echo "usage: m2d-prep-usb [--keys FILE] [--grub-entry] [--reboot]" >&2; exit 2 ;;
+    esac
+done
+[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+die() { echo "m2d-prep-usb: $*" >&2; exit 1; }
+
+pdev=$(blkid -L persistence) || die "no partition labelled 'persistence'"
+disk=/dev/$(lsblk -no PKNAME "$pdev" | head -1)
+ldev=
+for p in $(lsblk -rno PATH "$disk" | tail -n +2); do
+    [ "$(blkid -o value -s TYPE "$p")" = vfat ] || [ "$(blkid -o value -s TYPE "$p")" = iso9660 ] || continue
+    m=$(findmnt -no TARGET -S "$p" | head -1 || true)
+    if [ -n "$m" ]; then [ -f "$m/live/filesystem.squashfs" ] && ldev=$p
+    else
+        m=$(mktemp -d); mount -o ro "$p" "$m"
+        [ -f "$m/live/filesystem.squashfs" ] && ldev=$p
+        umount "$m"; rmdir "$m"
+    fi
+    [ -n "$ldev" ] && break
+done
+[ -n "$ldev" ] || die "no live medium (live/filesystem.squashfs) on $disk"
+echo "live medium $ldev, persistence $pdev"
+
+W=/mnt/m2d-prep; mkdir -p $W/{med,sq,per,root}
+cleanup() {
+    for m in $W/root/dev/pts $W/root/dev $W/root/sys $W/root/proc $W/root/run $W/root $W/sq $W/med $W/per; do
+        umount -l "$m" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT
+# The stick may be automounted by the desktop; reuse those mounts.
+medm=$(findmnt -no TARGET -S "$ldev" | head -1 || true); [ -n "$medm" ] || { mount -o ro "$ldev" $W/med; medm=$W/med; }
+perm=$(findmnt -no TARGET -S "$pdev" | head -1 || true); [ -n "$perm" ] || { mount "$pdev" $W/per; perm=$W/per; }
+grep -qx '/ union' "$perm/persistence.conf" 2>/dev/null || echo '/ union' > "$perm/persistence.conf"
+mkdir -p "$perm/rw" "$perm/work"
+mount -o ro,loop "$medm/live/filesystem.squashfs" $W/sq
+mount -t overlay overlay -o "lowerdir=$W/sq,upperdir=$perm/rw,workdir=$perm/work,redirect_dir=on" $W/root
+mount -t proc proc $W/root/proc; mount -t sysfs sys $W/root/sys
+mount --bind /dev $W/root/dev; mount --bind /dev/pts $W/root/dev/pts; mount -t tmpfs tmpfs $W/root/run
+
+R=$W/root
+echo "deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware" > $R/run/m2d-sources.list
+# resolv.conf in the image may be a symlink into /run (a tmpfs here): feed
+# DNS through wherever it points without writing into the overlay.
+if [ -L $R/etc/resolv.conf ]; then
+    t=$(readlink $R/etc/resolv.conf); case $t in /*) ;; *) t=/etc/$t ;; esac
+    mkdir -p "$R$(dirname "$t")"; cp -L /etc/resolv.conf "$R$t"
+else
+    cp -L /etc/resolv.conf $R/run/resolv.conf
+    mount --bind $R/run/resolv.conf $R/etc/resolv.conf
+fi
+printf '#!/bin/sh\nexit 101\n' > $R/usr/sbin/policy-rc.d; chmod +x $R/usr/sbin/policy-rc.d
+aptc="-o Dir::Etc::sourcelist=/run/m2d-sources.list -o Dir::Etc::sourceparts=-"
+chroot $R env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get $aptc update
+chroot $R env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get $aptc -y install openssh-server debootstrap gdisk efibootmgr
+chroot $R apt-get clean
+chroot $R systemctl enable ssh
+rm -f $R/usr/sbin/policy-rc.d
+umount $R/etc/resolv.conf 2>/dev/null || true
+
+if [ -s "$KEYS" ]; then
+    install -d -m700 $R/root/.ssh
+    cat "$KEYS" >> $R/root/.ssh/authorized_keys
+    sort -u -o $R/root/.ssh/authorized_keys $R/root/.ssh/authorized_keys
+    chmod 600 $R/root/.ssh/authorized_keys
+fi
+rsync -a --delete --exclude hosts/ --exclude .git/ --exclude "*.log" --exclude "wget-log*" "$SRC/" $R/opt/mint2deb/
+mkdir -p $R/opt/mint2deb/hosts
+ln -sfn /opt/mint2deb/m2d $R/usr/local/sbin/m2d
+cp "$SRC/README.md" "$perm/README-mint2deb.md" 2>/dev/null || true
+echo "persistence prepared: sshd + debootstrap + /opt/mint2deb"
+
+if [ -n "$GRUBENT" ]; then
+    luuid=$(blkid -o value -s UUID "$ldev")
+    kern=$(cd "$medm/live" && ls vmlinuz-* 2>/dev/null | head -1); kern=${kern:-vmlinuz}
+    initrd=$(cd "$medm/live" && ls initrd.img-* 2>/dev/null | head -1); initrd=${initrd:-initrd.img}
+    cat > /etc/grub.d/42_m2d_live <<EOF
+#!/bin/sh
+# mint2deb: boot the Debian live USB (with persistence) from this disk's GRUB
+cat <<'CFG'
+# if the USB can't be read (BIOS without USB int13), fall back to entry 0
+if [ "\${default}" = "m2d-live" ]; then set fallback=0; fi
+menuentry 'Debian Live USB (persistence)' --id m2d-live {
+	insmod part_msdos
+	insmod part_gpt
+	insmod fat
+	search --no-floppy --fs-uuid --set=root $luuid
+	linux /live/$kern boot=live persistence components quiet splash
+	initrd /live/$initrd
+}
+CFG
+EOF
+    chmod +x /etc/grub.d/42_m2d_live
+    update-grub
+    if [ -n "$REBOOT" ]; then
+        grub-reboot m2d-live
+        # UEFI: the firmware may start a boot manager in front of this GRUB
+        # (zmc2 has rEFInd first, which boots its last-used loader).  Point
+        # BootNext at this system's own GRUB/shim entry so next_entry is seen.
+        if [ -d /sys/firmware/efi ]; then
+            id=$(. /etc/os-release; echo "${ID_LIKE:-$ID}" | awk '{print $1}')
+            num=$(efibootmgr -v | grep -iE "^Boot[0-9a-f]{4}\*.*\\\\EFI\\\\($id|debian|ubuntu)\\\\(shim|grub)x64\.efi" \
+                  | head -1 | sed -E 's/^Boot([0-9A-Fa-f]{4}).*/\1/')
+            if [ -n "$num" ]; then efibootmgr -q -n "$num"; echo "firmware BootNext=$num ($(efibootmgr | grep "^Boot$num" | cut -c10-))"
+            else echo "WARNING: no EFI entry for this GRUB found; if the firmware's first entry is another boot manager, pick this GRUB by hand" >&2; fi
+        fi
+        echo "rebooting into the live USB once"
+        cleanup; trap - EXIT
+        systemctl reboot
+    fi
+fi

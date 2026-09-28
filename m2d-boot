@@ -1,0 +1,137 @@
+#!/bin/bash
+# m2d-boot [--default debian|mint]
+# Make the disk dual-bootable:
+#   * Debian's GRUB owns the boot path (MBR/bios_grub, or EFI/debian first in
+#     the firmware BootOrder on UEFI; a rEFInd on the ESP gets a menu entry)
+#   * Debian's menu: Debian first, then "<Mint> (Mint's own menu)" which
+#     configfile-chains Mint's grub.cfg -- so Mint kernel updates keep working
+#     without Debian having to re-run update-grub.  os-prober covers Windows.
+#   * Mint gets the reverse entry, and is told not to reinstall GRUB to the
+#     disk on its own updates (m2d-bootctl restore-mint undoes that).
+#   * m2d-bootctl is installed in both systems for remote one-shot switching.
+# --default picks the entry booted when nobody touches the menu (default: debian).
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+load_state
+DEFAULT=debian
+[ "${1:-}" = --default ] && DEFAULT=$2
+mount_mint rw
+target_setup
+chroot_mounts "$MINT"
+[ "$BOOTMODE" = uefi ] && [ -n "$ESP_SPEC" ] && do_mount "$ESP_SPEC" "$TARGET/boot/efi"
+
+mintname=${MINT_NAME:-Linux Mint}
+mint_cfg=/boot/grub/grub.cfg; [ -n "${MINT_BOOT_DEV:-}" ] && mint_cfg=/grub/grub.cfg
+mint_boot_uuid=$MINT_UUID; [ -n "${MINT_BOOT_DEV:-}" ] && mint_boot_uuid=$(blkid -o value -s UUID "$MINT_BOOT_DEV")
+
+# ---- Debian side -------------------------------------------------------------
+dg=$TARGET/etc/default/grub
+setg() { if grep -q "^$1=" "$dg"; then sed -i "s|^$1=.*|$1=$2|" "$dg"; else echo "$1=$2" >> "$dg"; fi; }
+setg GRUB_DEFAULT saved
+setg GRUB_TIMEOUT 5
+setg GRUB_TIMEOUT_STYLE menu
+setg GRUB_DISABLE_OS_PROBER false
+# Mint appears once, via its own menu, instead of os-prober's stale kernel list
+setg GRUB_OS_PROBER_SKIP_LIST "\"$MINT_UUID@$MINT_DEV\""
+
+cat > "$TARGET/etc/grub.d/25_m2d_mint" <<EOF
+#!/bin/sh
+# mint2deb: chain into Mint's own GRUB menu (stays correct across Mint updates)
+cat <<'CFG'
+menuentry '$mintname (Mint boot menu)' --class linuxmint --class gnu-linux --id m2d-mint {
+	insmod part_gpt
+	insmod part_msdos
+	insmod ext2
+	search --no-floppy --fs-uuid --set=root $mint_boot_uuid
+	configfile $mint_cfg
+}
+CFG
+EOF
+chmod +x "$TARGET/etc/grub.d/25_m2d_mint"
+
+# UEFI: a boot manager that used to be first in the firmware order (rEFInd on
+# zmc2) stays reachable from Debian's menu once grub-install puts Debian first.
+rm -f "$TARGET/etc/grub.d/27_m2d_refind"
+if [ "$BOOTMODE" = uefi ] && [ -f "$TARGET/boot/efi/EFI/refind/refind_x64.efi" ]; then
+    esp_uuid=$(findmnt -no UUID "$TARGET/boot/efi")
+    cat > "$TARGET/etc/grub.d/27_m2d_refind" <<EOF
+#!/bin/sh
+# mint2deb: chainload rEFInd from the shared ESP
+cat <<'CFG'
+menuentry 'rEFInd Boot Manager' --class efi --id m2d-refind {
+	insmod part_gpt
+	insmod part_msdos
+	insmod fat
+	insmod chain
+	search --no-floppy --fs-uuid --set=root $esp_uuid
+	chainloader /EFI/refind/refind_x64.efi
+}
+CFG
+EOF
+    chmod +x "$TARGET/etc/grub.d/27_m2d_refind"
+fi
+
+log "installing GRUB ($BOOTMODE) from Debian"
+if [ "$BOOTMODE" = uefi ]; then
+    extra=; [ -d /sys/firmware/efi ] || { extra=--no-nvram; warn "live session is BIOS: EFI boot entry not registered; run 'grub-install' again from Debian"; }
+    in_target grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian $extra
+    [ -d /sys/firmware/efi ] && log "firmware boot order now: $(efibootmgr | sed -n 's/^BootOrder: //p') (was ${EFI_BOOTORDER_ORIG:-unknown})"
+else
+    in_target grub-install --target=i386-pc "$DISK"
+    in_target debconf-set-selections <<EOF
+grub-pc grub-pc/install_devices multiselect $DISK
+grub-pc grub-pc/install_devices_empty boolean false
+EOF
+fi
+in_target update-initramfs -u -k all
+in_target update-grub
+
+# ---- Mint side ------------------------------------------------------------------
+cat > "$MINT/etc/grub.d/25_m2d_debian" <<EOF
+#!/bin/sh
+# mint2deb: chain into the Debian GRUB menu
+cat <<'CFG'
+menuentry 'Debian GNU/Linux $M2D_SUITE (Debian boot menu)' --class debian --class gnu-linux --id m2d-debian {
+	insmod part_gpt
+	insmod part_msdos
+	insmod ext2
+	search --no-floppy --fs-uuid --set=root $DEB_UUID
+	configfile /boot/grub/grub.cfg
+}
+CFG
+EOF
+chmod +x "$MINT/etc/grub.d/25_m2d_debian"
+mg=$MINT/etc/default/grub
+if grep -q '^GRUB_OS_PROBER_SKIP_LIST=' "$mg"; then
+    sed -i "s|^GRUB_OS_PROBER_SKIP_LIST=.*|GRUB_OS_PROBER_SKIP_LIST=\"$DEB_UUID@$DEB_DEV\"|" "$mg"
+else echo "GRUB_OS_PROBER_SKIP_LIST=\"$DEB_UUID@$DEB_DEV\"" >> "$mg"; fi
+# Chained from Debian's menu, a "hidden" Mint menu is just a blank pause.
+cp -n "$mg" "$HOSTDIR/mint-default-grub.orig"
+sed -i 's/^GRUB_TIMEOUT_STYLE=hidden/GRUB_TIMEOUT_STYLE=menu/; s/^GRUB_TIMEOUT=[0-9]*/GRUB_TIMEOUT=5/' "$mg"
+# Chained, Mint's grub.cfg keeps its recordfail flag in *Debian's* grubenv,
+# where Mint never clears it -> cap the "last boot failed" menu wait.
+grep -q '^GRUB_RECORDFAIL_TIMEOUT=' "$mg" || echo 'GRUB_RECORDFAIL_TIMEOUT=5' >> "$mg"
+# Mint's grub package updates must not take the disk back.
+in_mint debconf-set-selections <<'EOF'
+grub-pc grub-pc/install_devices multiselect
+grub-pc grub-pc/install_devices_empty boolean true
+grub2 grub2/update_nvram boolean false
+EOF
+in_mint update-grub || warn "Mint update-grub failed (Mint still boots via Debian's menu entry)"
+
+# ---- m2d-bootctl in both systems -------------------------------------------------
+for r in "$TARGET" "$MINT"; do
+    sed -e "s|@DEB_UUID@|$DEB_UUID|" -e "s|@MINT_UUID@|$MINT_UUID|" -e "s|@DISK@|$DISK|" \
+        -e "s|@BOOTMODE@|$BOOTMODE|" -e "s|@EFI_BOOTORDER_ORIG@|${EFI_BOOTORDER_ORIG:-}|" \
+        "$M2D_HOME/m2d-bootctl.in" > "$r/usr/local/sbin/m2d-bootctl"
+    chmod 755 "$r/usr/local/sbin/m2d-bootctl"
+done
+
+deb_id=gnulinux-simple-$DEB_UUID
+case $DEFAULT in
+    mint)   in_target grub-editenv /boot/grub/grubenv set saved_entry=m2d-mint ;;
+    *)      in_target grub-editenv /boot/grub/grubenv set saved_entry="$deb_id" ;;
+esac
+target_teardown
+mark_done boot
+log "boot set up: Debian GRUB owns $DISK, default entry = $DEFAULT"
+log "one-shot switch from either OS: m2d-bootctl next mint|debian ; m2d-bootctl default mint|debian"

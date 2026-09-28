@@ -1,0 +1,129 @@
+#!/bin/bash
+# m2d-split [--deb-size SIZE | --mint-size SIZE] [--backup DIR] [--yes]
+# Shrink the Mint root filesystem + partition and create a new ext4 partition
+# (label $M2D_LABEL) in the freed tail.  Without --yes it only prints the plan.
+# SIZE is in MiB or with a G suffix (e.g. 60G).
+# --backup DIR rsyncs the Mint root to DIR/<host>-mint-root first (DIR must
+# be on a different disk/partition).
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+load_state
+
+DEB_MIB= MINT_MIB= BACKUP= YES=
+tomib() { case $1 in *[Gg]) echo $(( ${1%[Gg]} * 1024 )) ;; *[Mm]) echo "${1%[Mm]}" ;; *) echo "$1" ;; esac; }
+while [ $# -gt 0 ]; do
+    case $1 in
+        --deb-size)  DEB_MIB=$(tomib "$2"); shift 2 ;;
+        --mint-size) MINT_MIB=$(tomib "$2"); shift 2 ;;
+        --backup)    BACKUP=$2; shift 2 ;;
+        --yes)       YES=1; shift ;;
+        *) die "usage: m2d-split [--deb-size SIZE|--mint-size SIZE] [--backup DIR] [--yes]" ;;
+    esac
+done
+
+if [ -n "${DEB_DEV:-}" ] && [ "$(blkid -o value -s LABEL "$DEB_DEV" 2>/dev/null)" = "$M2D_LABEL" ]; then
+    log "already split: Debian partition is $DEB_DEV"; exit 0
+fi
+
+total=$MINT_PART_MIB used=$MINT_USED_MIB
+keep_min=$(( used + used / 4 + 10240 ))            # Mint keeps used + 25% + 10G
+if [ -n "$MINT_MIB" ]; then DEB_MIB=$(( total - MINT_MIB ))
+elif [ -z "$DEB_MIB" ]; then
+    DEB_MIB=$(( total / 2 ))
+    [ $(( total - DEB_MIB )) -lt $keep_min ] && DEB_MIB=$(( total - keep_min ))
+fi
+MINT_MIB=$(( total - DEB_MIB - 1 ))                 # 1 MiB slack for alignment
+[ $DEB_MIB -ge 20480 ] || die "only ${DEB_MIB} MiB for Debian (need >= 20G); partition too small/full"
+[ $MINT_MIB -ge $(( used + 4096 )) ] || die "Mint would get ${MINT_MIB} MiB but uses ${used} MiB"
+
+ss=$SECTOR_SIZE
+align=$(( 1048576 / ss ))
+line=$(sfdisk -d "$DISK" | awk -v d="$MINT_DEV" '$1==d')
+[ -n "$line" ] || die "$MINT_DEV not in sfdisk dump of $DISK"
+rstart=$(sed -n 's/.*start= *\([0-9]*\).*/\1/p' <<<"$line")
+rsize=$(sed -n 's/.*size= *\([0-9]*\).*/\1/p' <<<"$line")
+rend=$(( rstart + rsize ))                          # exclusive
+new_rsize=$(( MINT_MIB * align ))
+nstart=$(( (rstart + new_rsize + align - 1) / align * align ))
+nsize=$(( rend - nstart ))
+[ $nsize -gt 0 ] || die "arithmetic went wrong (nsize=$nsize)"
+
+# Pick the new partition's number.
+used_nums=$(sfdisk -d "$DISK" | sed -n 's|^/dev/[^ ]*[^0-9]\([0-9]\+\) :.*|\1|p' | sort -n)
+if [ "$PTTYPE" = gpt ]; then
+    n=1; while grep -qx $n <<<"$used_nums"; do n=$((n+1)); done
+    ptype=0FC63DAF-8483-4772-8E79-3D69D8477DE4
+elif [ "$MINT_PARTN" -ge 5 ]; then
+    # logical: must be the last logical and end where the extended ends
+    n=$(( $(tail -1 <<<"$used_nums") + 1 ))
+    [ "$MINT_PARTN" -eq $(( n - 1 )) ] || die "Mint root is logical but not the last logical partition"
+    # A logical partition is preceded by its EBR, which needs free sectors
+    # inside the extended partition: leave a 1 MiB gap (zmc2 failed without it).
+    nstart=$(( nstart + align )); nsize=$(( nsize - align ))
+    ptype=83
+else
+    n=; for i in 1 2 3 4; do grep -qx $i <<<"$used_nums" || { n=$i; break; }; done
+    [ -n "$n" ] || die "msdos table has no free primary slot"
+    ptype=83
+fi
+NEW_DEV=$(part_dev "$DISK" $n)
+
+cat <<EOF
+
+  disk        $DISK ($PTTYPE, ${ss}-byte sectors)
+  Mint root   $MINT_DEV  ${total} MiB -> ${MINT_MIB} MiB  (${used} MiB used)
+  new Debian  $NEW_DEV  $(( nsize / align )) MiB  start=$nstart size=$nsize  label=$M2D_LABEL
+  backup      ${BACKUP:-none}
+EOF
+[ -n "$YES" ] || { echo; echo "Dry run. Re-run with --yes to do it."; exit 0; }
+
+# Nothing on the Mint partition may be mounted.
+for m in $(findmnt -rno TARGET -S "$MINT_DEV" || true); do umount "$m"; done
+! findmnt -S "$MINT_DEV" >/dev/null || die "$MINT_DEV is still mounted"
+
+# Build + validate the new table before touching the filesystem.
+before=$HOSTDIR/ptable-before-split.sfdisk
+sfdisk -d "$DISK" > "$before"
+new=$HOSTDIR/ptable-after-split.sfdisk
+awk -v d="$MINT_DEV" -v s="$new_rsize" '
+    $1==d { sub(/size= *[0-9]+/, "size=" s) } { print }' "$before" > "$new"
+echo "$NEW_DEV : start=$nstart, size=$nsize, type=$ptype" >> "$new"
+sfdisk --no-act --force "$DISK" < "$new" > "$HOSTDIR/sfdisk-noact.log" 2>&1 \
+    || { cat "$HOSTDIR/sfdisk-noact.log"; die "sfdisk rejected the new table (nothing changed)"; }
+log "saved old table to $before (restore: sfdisk --force $DISK < $before)"
+
+if [ -n "$BACKUP" ]; then
+    log "backing up Mint root to $BACKUP/$MINT_HOST-mint-root"
+    mkdir -p "$BACKUP/$MINT_HOST-mint-root"
+    mount_mint ro
+    rsync -aHAX --numeric-ids --delete "$MINT/" "$BACKUP/$MINT_HOST-mint-root/"
+    cleanup_mounts
+fi
+
+log "fsck $MINT_DEV"
+rc=0; e2fsck -f -y "$MINT_DEV" || rc=$?
+[ $rc -lt 4 ] || die "e2fsck failed (rc=$rc) -- not resizing"
+
+log "shrinking filesystem to ${MINT_MIB} MiB"
+resize2fs "$MINT_DEV" "${MINT_MIB}M"
+
+log "writing new partition table"
+sfdisk --no-reread --force "$DISK" < "$new"
+partx -u "$DISK" 2>/dev/null || true
+partx -a "$DISK" 2>/dev/null || true
+udevadm settle
+[ -b "$NEW_DEV" ] || die "$NEW_DEV did not appear (reboot the live system, then run m2d-split --yes again)"
+
+rc=0; e2fsck -f -y "$MINT_DEV" || rc=$?
+[ $rc -lt 4 ] || die "e2fsck after shrink failed (rc=$rc); restore table: sfdisk --force $DISK < $before"
+resize2fs "$MINT_DEV"            # grow into any alignment slack
+
+log "creating ext4 on $NEW_DEV"
+wipefs -a "$NEW_DEV"
+mkfs.ext4 -q -F -L "$M2D_LABEL" "$NEW_DEV"
+udevadm settle
+set_state DEB_DEV "$NEW_DEV"
+set_state DEB_PARTN "$n"
+set_state DEB_UUID "$(blkid -o value -s UUID "$NEW_DEV")"
+set_state MINT_PART_MIB "$(( $(blockdev --getsize64 "$MINT_DEV") / 1048576 ))"
+mark_done split
+log "done: Mint $MINT_DEV, Debian $NEW_DEV ($DEB_UUID).  Next: m2d-install"
