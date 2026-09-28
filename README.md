@@ -81,10 +81,12 @@ For each user, on Mint, before `m2d migrate`:
 - **Bookmarks:** Bookmarks → Manage Bookmarks → Import and Backup →
   **Export Bookmarks to HTML**, or **Backup** for a JSON file. Import the
   file in Debian's Firefox.
-- **History:** Firefox has no history export. Keep a copy of
-  `places.sqlite` from the profile directory under `~/.mozilla/firefox/`.
-  Better still, sign in to a Firefox account on Mint and let it sync. Debian's
-  Firefox then pulls bookmarks, history and passwords.
+- **History:** Firefox has no built-in history export, but history-export
+  add-ons on addons.mozilla.org do it. Export on Mint and import in Debian's
+  Firefox with the same add-on. Alternatively, sign in to a Firefox account on
+  Mint and let it sync, and Debian's Firefox pulls bookmarks, history and
+  passwords. As a fallback, keep a copy of `places.sqlite` from the profile
+  directory under `~/.mozilla/firefox/`.
 - **Passwords:** Settings → Passwords → ⋯ → **Export passwords** (a CSV
   file, so delete it after importing).
 
