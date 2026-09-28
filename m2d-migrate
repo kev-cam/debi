@@ -18,7 +18,7 @@ log "users and groups"
 mint_users=$(awk -F: '$3>=1000 && $3<60000 {print $1}' "$MINT/etc/passwd")
 while IFS=: read -r g _ gid _; do                  # user-range groups, same GID
     [ "$gid" -ge 1000 ] && [ "$gid" -lt 60000 ] || continue
-    getent -s files group "$g" >/dev/null 2>&1 && continue
+    in_target getent group "$g" >/dev/null 2>&1 && continue   # (in the target: reruns must skip what the 1st run added)
     in_target groupadd -g "$gid" "$g" 2>/dev/null || in_target groupadd "$g"
 done < "$MINT/etc/group"
 for u in $mint_users; do
