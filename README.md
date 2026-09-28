@@ -187,6 +187,12 @@ machines, it restores the firmware `BootOrder` saved by `m2d survey`.
   stripped, since it would make the whole ssh config fatal, and hosts that
   only offer DSA (old NAS boxes) can't be reached over ssh or sshfs from
   Debian.
+- **Not yet migrated: netplan-held connections.** Mint 22 (Ubuntu 24.04
+  base) can store NetworkManager connections as netplan files,
+  `/etc/netplan/90-NM-<uuid>.yaml`, instead of in
+  `/etc/NetworkManager/system-connections/`. `m2d-migrate` copies only the
+  latter. On zmc2 the Wi-Fi connection "scorpius5" was lost this way. Re-add
+  it in Debian, or convert the YAML to a keyfile by hand.
 - Rollback: `hosts/<host>/ptable-before-split.sfdisk` holds the original
   partition table. The shrunk Mint filesystem stays valid under either table
   and can be grown back with `resize2fs`.
