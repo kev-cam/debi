@@ -6,12 +6,14 @@
 #   m2d <step> [args]          run one step: survey split install migrate mythtv boot
 #   m2d fix-grub [opts]        rescue: reinstall Mint's GRUB (see m2d-fix-grub --help)
 #   m2d next [N|--default N]   list the boot menu, pick what boots next (see m2d-next --help)
+#   m2d update [--check|--ref R] update this toolkit from GitHub over HTTPS (see m2d-update --help)
 # Steps are resumable: rerunning 'all' skips finished steps.
 M2D_HOME=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 cmd=${1:-status}; shift || true
 case $cmd in
-    survey|split|install|migrate|mythtv|boot|fix-grub|next) exec "$M2D_HOME/m2d-$cmd" "$@" ;;
+    survey|split|install|migrate|mythtv|boot|fix-grub|next|update) exec "$M2D_HOME/m2d-$cmd" "$@" ;;
     status)
+        echo "toolkit: $(cat "$M2D_HOME/.m2d-version" 2>/dev/null || echo 'version unknown (never updated by m2d update)')"
         c=$M2D_HOME/hosts/current
         [ -e "$c/state.env" ] || { echo "no host surveyed yet (m2d survey)"; exit 0; }
         echo "host dir: $(readlink -f "$c")"; cat "$c/state.env"
@@ -26,5 +28,5 @@ case $cmd in
             done_ $s || "$M2D_HOME/m2d-$s"
         done
         echo "all steps done.  Reboot, pick Debian, then check: systemctl status mythtv-backend" ;;
-    *) sed -n '2,8s/^# \{0,1\}//p' "$0"; exit 2 ;;
+    *) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 2 ;;
 esac

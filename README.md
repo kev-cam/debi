@@ -24,7 +24,7 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
 
 | File | Purpose |
 |------|---------|
-| `m2d` | Driver: `m2d status`, `m2d <step>`, `m2d all [--yes]`, `m2d fix-grub`, `m2d next` |
+| `m2d` | Driver: `m2d status`, `m2d <step>`, `m2d all [--yes]`, `m2d fix-grub`, `m2d next`, `m2d update` |
 | `m2d-prep-usb` | Run on the Mint machine. Sets up the stick's persistence and reboots into it |
 | `m2d-survey` | Finds the Mint root and records the layout and inventory. Read-only |
 | `m2d-split` | Shrinks Mint's root and creates the Debian partition |
@@ -34,6 +34,7 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
 | `m2d-boot` | Debian GRUB, the Mint chain entry and `m2d-bootctl` |
 | `m2d-bootctl.in` | Template for the OS switcher installed in both systems |
 | `m2d-fix-grub` | Rescue: reinstall and regenerate Mint's GRUB from the stick. No survey needed |
+| `m2d-update` | Updates the toolkit on the stick from GitHub over HTTPS. `hosts/` is kept |
 | `m2d-next` | From the stick: find the GRUB that boots the machine, list its menu, set the next boot |
 | `lib.sh` | Shared helpers: state, mounts, chroot, apt |
 | `pkgmap.txt` | Mint/Ubuntu to Debian package name map, with `-` meaning drop |
@@ -122,6 +123,27 @@ then "Linux Mint … (Mint boot menu)". Then check the reports in
 - `packages-skipped.txt` lists what couldn't be carried over.
 - `etc-review.txt` lists modified or unowned `/etc` files that weren't copied.
 - `mint-thirdparty-repos.txt` lists third-party repos, which are not migrated.
+
+## Updating the toolkit on the stick
+
+In the live session, as root:
+
+    m2d update --check           # is main newer than what's installed?
+    m2d update                   # install the head of main
+    m2d update --ref 6d964a4     # a specific commit, tag or branch (pin / roll back)
+    m2d update --from debi.tar.gz   # offline, from a downloaded tarball
+    m2d status                   # first line shows the installed commit
+
+It downloads the GitHub tarball over plain HTTPS, so it needs no git and no
+keys. Before replacing anything it unpacks the tarball into a scratch
+directory and syntax-checks every script. `hosts/` is never touched. Files
+from the previous update that the new version no longer has are removed,
+except `m2d-update` itself, so a rollback can always roll forward again.
+
+It never runs by itself. Updating in the middle of a conversion would swap
+scripts under a half-finished run, so update between machines. `m2d-prep-usb`
+records the commit it copied, and marks it `-dirty` if the checkout had local
+changes.
 
 ## Rescue: Mint won't boot (GRUB broken)
 

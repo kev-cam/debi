@@ -83,7 +83,16 @@ if [ -s "$KEYS" ]; then
     sort -u -o $R/root/.ssh/authorized_keys $R/root/.ssh/authorized_keys
     chmod 600 $R/root/.ssh/authorized_keys
 fi
-rsync -a --delete --exclude hosts/ --exclude .git/ --exclude "*.log" --exclude "wget-log*" "$SRC/" $R/opt/mint2deb/
+rsync -a --delete --exclude hosts/ --exclude .git/ --exclude "*.log" --exclude "wget-log*" \
+    --exclude .m2d-version --exclude .m2d-manifest "$SRC/" $R/opt/mint2deb/
+# record what was installed, for "m2d status" / "m2d update --check"
+if sha=$(git -C "$SRC" rev-parse HEAD 2>/dev/null); then
+    # a checkout with local edits must never look "up to date" to m2d update
+    dirty=; [ -z "$(git -C "$SRC" status --porcelain 2>/dev/null)" ] || dirty=-dirty
+    echo "$sha$dirty file:$SRC $(date -u +%Y-%m-%dT%H:%MZ)" > $R/opt/mint2deb/.m2d-version
+    (cd $R/opt/mint2deb && find . -type f ! -path './hosts/*' ! -name '.m2d-*' ! -name '*.log' ! -name 'wget-log*' | sed 's|^\./||' | sort) \
+        > $R/opt/mint2deb/.m2d-manifest
+fi
 mkdir -p $R/opt/mint2deb/hosts
 ln -sfn /opt/mint2deb/m2d $R/usr/local/sbin/m2d
 cp "$SRC/README.md" "$perm/README-mint2deb.md" 2>/dev/null || true

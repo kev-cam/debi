@@ -1,0 +1,85 @@
+#!/bin/bash
+# m2d-update [--ref BRANCH|TAG|COMMIT] [--from FILE.tar.gz] [--check]
+# Update this toolkit in place from GitHub over plain HTTPS -- no git, no keys.
+#   (default)     install the head of main from github.com/kev-cam/debi
+#   --ref R       install a branch, tag or commit instead (pin / roll back)
+#   --from F      install from a local tarball (offline; any top-level dir name)
+#   --check       only say whether an update is available
+# hosts/ (the per-machine records) is never touched.  The new version is
+# unpacked and syntax-checked before anything is replaced; files that the
+# previous update installed but the new version no longer has are removed.
+# Deliberately NOT automatic: don't swap scripts under a half-done conversion.
+set -euo pipefail
+REPO=${M2D_REPO:-kev-cam/debi}
+M2D_HOME=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+REF=main FROM= CHECK=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --ref) REF=$2; shift 2 ;;
+        --from) FROM=$2; shift 2 ;;
+        --check) CHECK=1; shift ;;
+        -h|--help) sed -n '2,/^set -e/{/^set -e/d;s/^# \{0,1\}//p}' "$0"; exit 0 ;;
+        *) echo "m2d-update: unknown option $1 (see --help)" >&2; exit 2 ;;
+    esac
+done
+die() { echo "m2d-update: $*" >&2; exit 1; }
+[ -w "$M2D_HOME" ] || die "$M2D_HOME is not writable (run as root)"
+cur=$(cat "$M2D_HOME/.m2d-version" 2>/dev/null || echo unknown)
+cursha=${cur%% *}
+
+# ---- which commit -----------------------------------------------------------
+sha=
+if [ -z "$FROM" ]; then
+    command -v curl >/dev/null || die "curl missing"
+    sha=$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.github.sha' \
+          "https://api.github.com/repos/$REPO/commits/$REF" 2>/dev/null || true)
+    [[ $sha =~ ^[0-9a-f]{40}$ ]] || sha=
+    if [ -n "$CHECK" ]; then
+        [ -n "$sha" ] || die "could not ask GitHub for $REPO@$REF (offline or rate-limited?)"
+        if [ "$cursha" = "$sha" ]; then echo "up to date: $REF = ${sha:0:7}"
+        else echo "update available: installed ${cursha:0:7}, $REF is ${sha:0:7}  (m2d update)"; fi
+        exit 0
+    fi
+    if [ -n "$sha" ] && [ "$cursha" = "$sha" ]; then echo "already at $REF = ${sha:0:7}"; exit 0; fi
+fi
+[ -z "$CHECK" ] || die "--check needs network (not --from)"
+
+# ---- fetch + unpack + verify, all in a scratch dir -----------------------------
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+if [ -n "$FROM" ]; then cp "$FROM" "$tmp/t.tgz"
+else
+    # by commit when the API answered, so what we install is what we report
+    curl -fsSL --max-time 120 -o "$tmp/t.tgz" "https://codeload.github.com/$REPO/tar.gz/${sha:-$REF}" \
+        || die "download of $REPO@${sha:-$REF} failed"
+fi
+mkdir "$tmp/x"; tar -xzf "$tmp/t.tgz" -C "$tmp/x" || die "not a valid .tar.gz"
+# GitHub tarballs carry the commit in a pax comment; use it if the API didn't answer
+[ -n "$sha" ] || sha=$(gzip -dc "$tmp/t.tgz" | head -c 4096 | grep -aoE 'comment=[0-9a-f]{40}' | head -1 | cut -d= -f2 || true)
+src=$(find "$tmp/x" -mindepth 1 -maxdepth 2 -name m2d -type f -printf '%h\n' | head -1)
+[ -n "$src" ] && [ -f "$src/lib.sh" ] || die "tarball does not contain the mint2deb toolkit"
+for f in "$src"/m2d* "$src"/lib.sh; do
+    case $f in *.in) continue ;; esac
+    bash -n "$f" || die "syntax error in $(basename "$f") -- nothing installed"
+done
+
+# ---- install --------------------------------------------------------------------
+new_list=$(cd "$src" && find . -type f ! -path './.git*' ! -name .gitignore ! -path './hosts/*' | sed 's|^\./||' | sort)
+old_list=$(sort "$M2D_HOME/.m2d-manifest" 2>/dev/null || true)
+while read -r f; do
+    [ -n "$f" ] || continue
+    mkdir -p "$M2D_HOME/$(dirname "$f")"
+    cp -p "$src/$f" "$M2D_HOME/$f.m2d-new" && mv -f "$M2D_HOME/$f.m2d-new" "$M2D_HOME/$f"
+done <<<"$new_list"
+# never remove the updater itself: rolling back to a commit that predates it
+# must still leave a way to roll forward again
+gone=$(comm -23 <(echo "$old_list") <(echo "$new_list") | grep -vx 'm2d-update' | grep . || true)
+for f in $gone; do rm -f "$M2D_HOME/$f"; done
+echo "$new_list" > "$M2D_HOME/.m2d-manifest"
+if [ -n "$FROM" ]; then from="file:$(basename "$FROM")"; else from="$REPO@$REF"; fi
+ver="${sha:-unknown} $from $(date -u +%Y-%m-%dT%H:%MZ)"
+echo "$ver" > "$M2D_HOME/.m2d-version"
+
+echo "updated: ${cursha:0:7} -> $([ -n "$sha" ] && echo "${sha:0:7}" || echo unknown)  ($from, $(wc -l <<<"$new_list") files)"
+[ -z "$gone" ] || echo "removed: $(tr '\n' ' ' <<<"$gone")"
+[ "$cur" = unknown ] && echo "(first update: files from older copies that the repo no longer has are left in place)"
+exit 0
