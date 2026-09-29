@@ -24,7 +24,7 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
 
 | File | Purpose |
 |------|---------|
-| `m2d` | Driver: `m2d status`, `m2d <step>`, `m2d all [--yes]` |
+| `m2d` | Driver: `m2d status`, `m2d <step>`, `m2d all [--yes]`, `m2d fix-grub`, `m2d next` |
 | `m2d-prep-usb` | Run on the Mint machine. Sets up the stick's persistence and reboots into it |
 | `m2d-survey` | Finds the Mint root and records the layout and inventory. Read-only |
 | `m2d-split` | Shrinks Mint's root and creates the Debian partition |
@@ -33,6 +33,8 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
 | `m2d-mythtv` | MythTV 35 from deb-multimedia, plus a copy of Mint's database |
 | `m2d-boot` | Debian GRUB, the Mint chain entry and `m2d-bootctl` |
 | `m2d-bootctl.in` | Template for the OS switcher installed in both systems |
+| `m2d-fix-grub` | Rescue: reinstall and regenerate Mint's GRUB from the stick. No survey needed |
+| `m2d-next` | From the stick: find the GRUB that boots the machine, list its menu, set the next boot |
 | `lib.sh` | Shared helpers: state, mounts, chroot, apt |
 | `pkgmap.txt` | Mint/Ubuntu to Debian package name map, with `-` meaning drop |
 
@@ -120,6 +122,54 @@ then "Linux Mint … (Mint boot menu)". Then check the reports in
 - `packages-skipped.txt` lists what couldn't be carried over.
 - `etc-review.txt` lists modified or unowned `/etc` files that weren't copied.
 - `mint-thirdparty-repos.txt` lists third-party repos, which are not migrated.
+
+## Rescue: Mint won't boot (GRUB broken)
+
+Boot the stick and, as root, run:
+
+    m2d fix-grub --dry-run      # shows the root, boot mode, target disk, kernels
+    m2d fix-grub                # dpkg --configure -a, grub-install, update-grub
+
+This needs no survey. It finds the Mint root itself, or you can pass
+`--root`. It takes the boot mode from the platform directory grub-install last
+populated in Mint's `/boot/grub`, falling back to Mint's GRUB packages. It
+doesn't use how the stick booted. In UEFI mode, a boot manager that was first
+in the firmware order, such as rEFInd, stays first. In BIOS mode it installs to the disk named in Mint's own
+debconf (`grub-pc/install_devices`); `--disk` overrides that. If the GRUB
+packages are missing it reinstalls them, which needs network access.
+
+Extra options:
+- `--initramfs` rebuilds the initramfs images, for example after
+  graphics-driver surgery.
+- `--nomodeset` boots past a broken GPU driver. Remove it again once
+  graphics work.
+
+On an m2d dual-boot, this hands the boot back to Mint's GRUB, and Debian stays
+in Mint's menu.
+
+## Choosing what boots next (from the live USB)
+
+    m2d next                     # which GRUB boots this machine + its numbered menu
+    m2d next 6                   # boot entry 6 once, then back to the default
+    m2d next 79-generic          # or pick by a unique piece of the title
+    m2d next --default 1         # change the default (only if GRUB_DEFAULT=saved)
+    m2d next --clear
+
+It finds the GRUB that actually boots the machine, rather than guessing from
+disk names:
+- **BIOS:** it matches the core image embedded after each disk's MBR against
+  every `/boot/grub/i386-pc/core.img`.
+- **UEFI:** it walks BootNext and then BootOrder to the first entry that is a
+  GRUB (an `EFI/<id>/grub.cfg` beside it), and from there to the partition
+  that file searches for. If something else starts first, such as rEFInd on
+  zmc2 or the stick itself, a one-shot choice also sets the firmware's
+  `BootNext` to that GRUB.
+
+It then edits that GRUB's 1024-byte `grubenv` in place. Submenu entries such as
+specific kernels work.
+
+When you reboot, remove the stick or pick the disk in the firmware boot menu,
+because the stick may be first in the boot order.
 
 ## Switching OS remotely
 

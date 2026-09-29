@@ -1,0 +1,200 @@
+#!/bin/bash
+# m2d-next [ENTRY | --clear | --default ENTRY] [--disk DEV]
+# From the live USB: find the GRUB that actually boots this machine, list its
+# menu, and pick what boots next.
+#   m2d-next                 list bootable entries (numbered), current default/next
+#   m2d-next ENTRY           boot ENTRY once on the next reboot
+#   m2d-next --default ENTRY make ENTRY the default (needs GRUB_DEFAULT=saved)
+#   m2d-next --clear         forget a pending one-shot choice
+#   --disk DEV               BIOS: look only at this disk's MBR
+# ENTRY is a number from the list, an entry id, or a piece of the title
+# ("79-generic").  Entries inside a submenu work too.
+# The owner is found exactly: BIOS -> the core image embedded after the MBR is
+# matched against each /boot/grub/i386-pc/core.img; UEFI -> the firmware's
+# BootNext/BootOrder -> EFI/<id>/grub.cfg -> the partition it searches for.
+# Remember the USB itself may be first in the firmware boot order: remove it
+# (or pick the disk in the boot menu) when rebooting.
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+ACTION=list ARG= DISKARG=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --clear) ACTION=clear; shift ;;
+        --default) ACTION=default; ARG=$2; shift 2 ;;
+        --disk) DISKARG=$2; shift 2 ;;
+        -h|--help) sed -n '2,/^\. /{/^\. /d;s/^# \{0,1\}//p}' "$0"; exit 0 ;;
+        -*) die "unknown option $1 (see --help)" ;;
+        *) ACTION=next; ARG=$1; shift ;;
+    esac
+done
+
+live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || true)
+live_disk=${live_src:+$(lsblk -no PKNAME "$live_src" | head -1)}
+P=/mnt/m2d-next
+
+# mount_ro_noload dev dir: look without replaying journals (RAID/data disks!)
+mnt_look() { mkdir -p "$2"; mount -o ro,noload "$1" "$2" 2>/dev/null || mount -o ro "$1" "$2" 2>/dev/null; }
+
+OWNER= GRUBDIR= HOW=
+# ---- BIOS: which partition's core.img is embedded on a disk -------------------
+ext_parts() {   # ext2/3/4 partitions, optionally of one disk, never the live USB's
+    lsblk -rno PATH,FSTYPE,PKNAME $1 2>/dev/null |
+        awk -v l="$live_disk" '$2 ~ /^ext[234]$/ && (l == "" || $3 != l) {print $1}'
+}
+sector_score() {   # sector_score file disk lba -> number of identical 512-byte sectors
+    local f=$1 d=$2 lba=$3 n i s=0
+    n=$(( $(stat -c %s "$f") / 512 ))          # whole sectors only
+    cmp -l <(head -c $((n * 512)) "$f") <(dd if="$d" bs=512 skip="$lba" count="$n" 2>/dev/null) 2>/dev/null |
+        awk -v n="$n" '{bad[int(($1 - 1) / 512)] = 1} END {c = 0; for (k in bad) c++; print n - c}'
+}
+find_bios_owner() {
+    local d lba f dev n best=0 total
+    for d in ${DISKARG:-$(lsblk -dno NAME | sed 's|^|/dev/|')}; do
+        [ "$(lsblk -dno TYPE "$d" 2>/dev/null)" = disk ] || continue
+        [ -n "$live_disk" ] && [ "$d" = "/dev/$live_disk" ] && continue
+        dd if="$d" bs=512 count=1 2>/dev/null | grep -qa GRUB || continue
+        # boot.img keeps core.img's first sector (LE64) at offset 0x5c
+        lba=$(dd if="$d" bs=1 skip=$((0x5c)) count=8 2>/dev/null | od -An -tu8 | tr -d ' ')
+        [ -n "$lba" ] && [ "$lba" -gt 0 ] || continue
+        # grub-bios-setup patches a few sectors of core.img as it embeds it, so
+        # score candidates by identical sectors: another build differs almost
+        # everywhere (it is LZMA-compressed).  Own disk first, then all disks.
+        for pass in "$d" ""; do
+            for dev in $(ext_parts $pass); do
+                mnt_look "$dev" $P || continue
+                for f in $P/boot/grub/i386-pc/core.img $P/grub/i386-pc/core.img; do
+                    [ -f "$f" ] || continue
+                    n=$(sector_score "$f" "$d" "$lba"); total=$(( $(stat -c %s "$f") / 512 ))
+                    if [ "$n" -gt "$best" ] && [ $((n * 10)) -ge $((total * 8)) ]; then
+                        best=$n OWNER=$dev GRUBDIR=${f#"$P"}; GRUBDIR=${GRUBDIR%/i386-pc/core.img}
+                        HOW="BIOS: GRUB in the MBR of $d loads $dev:$GRUBDIR ($n/$total sectors match)"
+                    fi
+                done
+                umount $P
+            done
+            [ -n "$OWNER" ] && return 0
+        done
+    done
+    return 1
+}
+# ---- UEFI: firmware choice -> ESP grub.cfg -> searched partition ------------------
+GRUB_BOOTNUM= FIRST_BOOTNUM=
+find_uefi_owner() {
+    command -v efibootmgr >/dev/null && [ -d /sys/firmware/efi ] || return 1
+    local v n line part path esp cfg uuid pre owner cands
+    v=$(efibootmgr -v 2>/dev/null) || return 1
+    FIRST_BOOTNUM=$(sed -n 's/^BootOrder: \([0-9A-F]*\).*/\1/p' <<<"$v")
+    # BootNext, then BootOrder: the first entry that is a GRUB (has a grub.cfg
+    # beside it) and isn't on the live USB.  Something else may sit in front
+    # of it (rEFInd on zmc2, or the stick): that's handled with BootNext.
+    cands="$(sed -n 's/^BootNext: //p' <<<"$v") $(sed -n 's/^BootOrder: //p' <<<"$v" | tr ',' ' ')"
+    for n in $cands; do
+        line=$(grep -E "^Boot$n" <<<"$v") || continue
+        part=$(grep -oiE 'GPT,[0-9a-f-]{36}' <<<"$line" | cut -d, -f2)
+        path=$(grep -oE 'File\([^)]*\)' <<<"$line" | sed 's/File(\(.*\))/\1/; s|\\|/|g')
+        [ -n "$part" ] && [ -n "$path" ] || continue
+        esp=$(blkid -t PARTUUID="$part" -o device | head -1); [ -n "$esp" ] || continue
+        [ -n "$live_disk" ] && [ "$(lsblk -no PKNAME "$esp" | head -1)" = "$live_disk" ] && continue
+        mnt_look "$esp" $P || continue
+        cfg=$P$(dirname "$path")/grub.cfg
+        uuid=$(grep -oE 'search\.fs_uuid [0-9a-fA-F-]+' "$cfg" 2>/dev/null | awk '{print $2}' | head -1)
+        pre=$(sed -n "s/.*set prefix=(\$root)'\{0,1\}\([^']*\)'\{0,1\}.*/\1/p" "$cfg" 2>/dev/null | head -1)
+        umount $P
+        [ -n "$uuid" ] && owner=$(blkid -U "$uuid") || continue
+        OWNER=$owner GRUBDIR=${pre:-/boot/grub} GRUB_BOOTNUM=$n
+        HOW="UEFI: firmware Boot$n $path on $esp loads $OWNER:$GRUBDIR"
+        [ "$n" = "$FIRST_BOOTNUM" ] || HOW="$HOW
+      (firmware starts Boot$FIRST_BOOTNUM '$(grep -E "^Boot$FIRST_BOOTNUM" <<<"$v" | cut -c10- | sed 's/\t.*//')' first: a one-shot choice also sets BootNext=$n)"
+        return 0
+    done
+    return 1
+}
+if [ -d /sys/firmware/efi ] && [ -z "$DISKARG" ]; then find_uefi_owner || find_bios_owner || true
+else find_bios_owner || find_uefi_owner || true; fi
+[ -n "$OWNER" ] || die "could not work out which GRUB boots this machine (try --disk /dev/X)"
+
+if [ "$ACTION" = list ]; then mnt_look "$OWNER" $P || die "cannot mount $OWNER"
+elif findmnt -rn -S "$OWNER" >/dev/null; then die "$OWNER is mounted elsewhere; unmount it (or finish the m2d step using it) first"
+else do_mount "$OWNER" $P; fi
+M2D_MOUNTS+=($P)
+CFG=$P$GRUBDIR/grub.cfg ENV=$P$GRUBDIR/grubenv
+[ -f "$CFG" ] || die "$CFG missing -- run m2d fix-grub"
+
+# ---- menu: "id<TAB>title<TAB>depth" (submenu children get "parent>child" ids) ----
+menu=$(awk '
+    function q1(s,   m) { if (match(s, /'"'"'[^'"'"']*'"'"'/)) return substr(s, RSTART+1, RLENGTH-2); return "" }
+    function eid(s,   t) {
+        if (match(s, /\$menuentry_id_option '"'"'[^'"'"']*'"'"'/)) { t = substr(s, RSTART, RLENGTH); return q1(t) }
+        if (match(s, /--id[ =][^ {]+/)) { t = substr(s, RSTART+5, RLENGTH-5); gsub(/'"'"'/, "", t); return t }
+        return "" }
+    /^submenu / { sid = eid($0); stitle = q1($0); insub = 1; print sid "\t" stitle " >\t0"; next }
+    insub && /^}/ { insub = 0; next }
+    /^[ \t]*menuentry / {
+        id = eid($0); t = q1($0); if (id == "") id = t
+        if (insub) print sid ">" id "\t" t "\t1"; else print id "\t" t "\t0" }
+' "$CFG")
+[ -n "$menu" ] || die "no menu entries in $CFG"
+honours_next=$(grep -c 'next_entry' "$CFG" || true)
+honours_saved=$(grep -c 'set default="\${saved_entry}"' "$CFG" || true)
+env_get() { sed -n "s/^$1=//p" "$ENV" 2>/dev/null; }
+
+resolve() {   # resolve ENTRY -> id (selectable entries only)
+    local a=$1 sel
+    sel=$(awk -F'\t' '$2 !~ / >$/' <<<"$menu")
+    if [[ $a =~ ^[0-9]+$ ]]; then
+        awk -F'\t' -v n="$a" 'NR==n {print $1}' <<<"$(nl_menu)" | grep . || die "no entry number $a"
+        return
+    fi
+    awk -F'\t' -v a="$a" '$1==a {print $1; f=1; exit} END{exit !f}' <<<"$sel" && return
+    local hits; hits=$(awk -F'\t' -v a="$a" 'index(tolower($2), tolower(a)) {print $1}' <<<"$sel")
+    [ -n "$hits" ] || die "no entry matches '$a'"
+    [ "$(wc -l <<<"$hits")" -eq 1 ] || die "'$a' matches $(wc -l <<<"$hits") entries -- use the number"
+    echo "$hits"
+}
+nl_menu() { awk -F'\t' '$2 !~ / >$/' <<<"$menu"; }
+
+# grubenv is a fixed 1024-byte block GRUB rewrites in place: edit it in place too
+env_set() {   # env_set KEY [VALUE]   (no VALUE = unset)
+    local tmp; tmp=$(mktemp)
+    { echo '# GRUB Environment Block'
+      grep -vE "^(#|$1=)" "$ENV" 2>/dev/null || true
+      [ $# -ge 2 ] && echo "$1=$2"; } > "$tmp"
+    [ "$(stat -c %s "$tmp")" -le 1024 ] || die "grubenv would exceed 1024 bytes"
+    { cat "$tmp"; head -c $((1024 - $(stat -c %s "$tmp"))) /dev/zero | tr '\0' '#'; } > "$tmp.full"
+    if [ -f "$ENV" ] && [ "$(stat -c %s "$ENV")" -eq 1024 ]; then dd if="$tmp.full" of="$ENV" conv=notrunc status=none
+    else cp "$tmp.full" "$ENV"; fi
+    sync; rm -f "$tmp" "$tmp.full"
+}
+
+case $ACTION in
+list)
+    echo "$HOW"
+    echo "menu: $(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}/\1/p' $P/etc/os-release 2>/dev/null) GRUB ($OWNER$GRUBDIR/grub.cfg)"
+    echo
+    i=0
+    while IFS=$'\t' read -r id title depth; do
+        if [[ $title == *" >" ]]; then printf '     %s\n' "$title"; continue; fi
+        i=$((i+1)); ind=""; [ "$depth" = 1 ] && ind="  "
+        printf '%3d  %s%s\n' $i "$ind" "$title"
+    done <<<"$menu"
+    echo
+    echo "default: $(env_get saved_entry | grep . || echo 'first entry')$([ "$honours_saved" -gt 0 ] || echo '   (GRUB_DEFAULT is fixed; --default not available)')"
+    echo "next:    $(env_get next_entry | grep . || echo '-')"
+    [ "$honours_next" -gt 0 ] || warn "this grub.cfg ignores next_entry -- one-shot choices won't work"
+    echo; echo "boot one once:  m2d next <number|title-part>" ;;
+next)
+    [ "$honours_next" -gt 0 ] || die "$CFG does not support next_entry"
+    id=$(resolve "$ARG"); env_set next_entry "$id"
+    echo "next boot: $(awk -F'\t' -v i="$id" '$1==i {print $2}' <<<"$menu")  [$id]"
+    if [ -n "$GRUB_BOOTNUM" ] && [ "$GRUB_BOOTNUM" != "$FIRST_BOOTNUM" ]; then
+        efibootmgr -q -n "$GRUB_BOOTNUM" && echo "firmware BootNext=$GRUB_BOOTNUM (so this GRUB, not Boot$FIRST_BOOTNUM, starts)"
+    fi
+    echo "then back to: $(env_get saved_entry | grep . || echo 'the first entry')" ;;
+default)
+    [ "$honours_saved" -gt 0 ] || die "this GRUB has a fixed default; set GRUB_DEFAULT=saved in that system's /etc/default/grub and run update-grub there"
+    id=$(resolve "$ARG"); env_set saved_entry "$id"
+    echo "default: $(awk -F'\t' -v i="$id" '$1==i {print $2}' <<<"$menu")  [$id]" ;;
+clear)
+    env_set next_entry; echo "pending one-shot choice cleared"
+    [ -n "$GRUB_BOOTNUM" ] && efibootmgr 2>/dev/null | grep -q "^BootNext: $GRUB_BOOTNUM" && efibootmgr -q -N && echo "firmware BootNext cleared" || true ;;
+esac

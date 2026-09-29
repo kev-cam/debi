@@ -4,11 +4,13 @@
 #   m2d all [--yes] [split opts] survey -> split -> install -> migrate -> mythtv -> boot
 #                              (stops after the split plan unless --yes)
 #   m2d <step> [args]          run one step: survey split install migrate mythtv boot
+#   m2d fix-grub [opts]        rescue: reinstall Mint's GRUB (see m2d-fix-grub --help)
+#   m2d next [N|--default N]   list the boot menu, pick what boots next (see m2d-next --help)
 # Steps are resumable: rerunning 'all' skips finished steps.
 M2D_HOME=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 cmd=${1:-status}; shift || true
 case $cmd in
-    survey|split|install|migrate|mythtv|boot) exec "$M2D_HOME/m2d-$cmd" "$@" ;;
+    survey|split|install|migrate|mythtv|boot|fix-grub|next) exec "$M2D_HOME/m2d-$cmd" "$@" ;;
     status)
         c=$M2D_HOME/hosts/current
         [ -e "$c/state.env" ] || { echo "no host surveyed yet (m2d survey)"; exit 0; }

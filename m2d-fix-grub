@@ -1,0 +1,208 @@
+#!/bin/bash
+# m2d-fix-grub [--root DEV] [--disk DEV] [--mode bios|uefi] [--reinstall]
+#              [--initramfs] [--nomodeset] [--dry-run]
+# Rescue: make an installed Mint (or Ubuntu) system bootable again from the
+# live USB.  Mounts its root (plus /boot and the ESP from its own fstab),
+# chroots in, repairs half-configured packages, and re-runs grub-install +
+# update-grub.  Does not need m2d-survey; nothing else on the disk is touched.
+#
+#   --root DEV    Mint root partition (default: the one m2d surveyed, else the
+#                 single linuxmint/ubuntu ext4 root found)
+#   --disk DEV    BIOS only: disk whose MBR gets GRUB (default: what Mint's own
+#                 debconf grub-pc/install_devices says, else the root's disk)
+#   --mode M      bios|uefi (default: from the grub packages Mint has installed;
+#                 NOT from how the live USB booted)
+#   --reinstall   apt-get --reinstall the grub packages (needs network; done
+#                 automatically if grub-install is missing)
+#   --initramfs   also rebuild all initramfs images (after driver changes)
+#   --nomodeset   add "nomodeset" to the default kernel command line (boot with
+#                 a broken GPU driver; remove it again once graphics work)
+#   --dry-run     show what would be done, write nothing
+# After this, Mint's GRUB owns the boot again.  On an m2d dual-boot Debian is
+# still in Mint's menu; to hand the boot back to Debian run, on Debian:
+#   grub-install <disk> && update-grub
+. "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+ROOT= DISKARG= MODE= REINSTALL= INITRAMFS= NOMODESET= DRY=
+while [ $# -gt 0 ]; do
+    case $1 in
+        --root) ROOT=$2; shift 2 ;;
+        --disk) DISKARG=$2; shift 2 ;;
+        --mode) MODE=$2; shift 2 ;;
+        --reinstall) REINSTALL=1; shift ;;
+        --initramfs) INITRAMFS=1; shift ;;
+        --nomodeset) NOMODESET=1; shift ;;
+        --dry-run) DRY=1; shift ;;
+        -h|--help) sed -n '2,/^\. /{/^\. /d;s/^# \{0,1\}//p}' "$0"; exit 0 ;;
+        *) die "unknown option $1 (see --help)" ;;
+    esac
+done
+
+is_mint_root() {   # is_mint_root dev -> 0 if it holds a Mint/Ubuntu root
+    local m=/mnt/m2d-fix-probe r=1
+    mkdir -p $m
+    mount -o ro "$1" $m 2>/dev/null || return 1
+    grep -qsE '^ID=(linuxmint|ubuntu)' $m/etc/os-release && [ -x $m/usr/bin/dpkg ] && r=0
+    umount $m
+    return $r
+}
+
+# ---- which root -------------------------------------------------------------
+if [ -z "$ROOT" ] && [ -f "$M2D_HOME/hosts/current/state.env" ]; then
+    ROOT=$(. "$M2D_HOME/hosts/current/state.env"; echo "${MINT_DEV:-}")
+    # device names can move between boots: trust the UUID if we have it
+    uuid=$(. "$M2D_HOME/hosts/current/state.env"; echo "${MINT_UUID:-}")
+    [ -n "$uuid" ] && [ -e "/dev/disk/by-uuid/$uuid" ] && ROOT=$(readlink -f "/dev/disk/by-uuid/$uuid")
+fi
+if [ -z "$ROOT" ]; then
+    live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || true)
+    live_disk=${live_src:+$(lsblk -no PKNAME "$live_src" | head -1)}
+    cands=()
+    while read -r name fstype; do
+        [ "$fstype" = ext4 ] || continue
+        [ -n "$live_disk" ] && [ "$(lsblk -no PKNAME "/dev/$name" | head -1)" = "$live_disk" ] && continue
+        is_mint_root "/dev/$name" && cands+=("/dev/$name")
+    done < <(lsblk -rno NAME,FSTYPE)
+    [ ${#cands[@]} -eq 1 ] || die "found ${#cands[@]} Mint/Ubuntu roots (${cands[*]:-none}); pass --root"
+    ROOT=${cands[0]}
+fi
+[ -b "$ROOT" ] || die "$ROOT is not a block device"
+if findmnt -rn -S "$ROOT" >/dev/null; then
+    die "$ROOT is mounted ($(findmnt -rno TARGET -S "$ROOT" | tr '\n' ' ')) -- wait for other m2d steps to finish / unmount it"
+fi
+
+R=/mnt/m2d-fix
+if [ -n "$DRY" ]; then do_mount -o ro "$ROOT" $R; else do_mount "$ROOT" $R; fi
+grep -qsE '^ID=(linuxmint|ubuntu)' $R/etc/os-release || die "$ROOT is not a Mint/Ubuntu root"
+name=$(. $R/etc/os-release; echo "$PRETTY_NAME")
+
+# /boot and ESP from the system's own fstab
+fsdev() { case $1 in UUID=*|LABEL=*|PARTUUID=*|PARTLABEL=*) findfs "$1" 2>/dev/null ;; /dev/*) echo "$1" ;; esac; }
+bootspec=$(awk '$1!~/^#/ && $2=="/boot" {print $1}' $R/etc/fstab)
+espspec=$(awk '$1!~/^#/ && $2=="/boot/efi" {print $1}' $R/etc/fstab)
+bootdev=${bootspec:+$(fsdev "$bootspec")}
+espdev=${espspec:+$(fsdev "$espspec")}
+[ -z "$bootspec" ] || [ -n "$bootdev" ] || die "/boot ($bootspec) from fstab not found"
+[ -n "$bootdev" ] && { if [ -n "$DRY" ]; then do_mount -o ro "$bootdev" $R/boot; else do_mount "$bootdev" $R/boot; fi; }
+
+# ---- mode -------------------------------------------------------------------
+pkg_ok() { grep -A1 -x "Package: $1" $R/var/lib/dpkg/status | grep -c 'Status: install ok installed' >/dev/null; }
+if [ -z "$MODE" ]; then
+    # Mint can have grub-pc AND grub-efi-amd64-signed installed (zmc2 does):
+    # first trust which platform grub-install last populated, then packages.
+    if [ -d $R/boot/grub/x86_64-efi ] && [ ! -d $R/boot/grub/i386-pc ]; then MODE=uefi
+    elif [ -d $R/boot/grub/i386-pc ] && [ ! -d $R/boot/grub/x86_64-efi ]; then MODE=bios
+    elif [ -n "$espdev" ] && [ -d /sys/firmware/efi ]; then MODE=uefi
+    elif pkg_ok grub-pc; then MODE=bios
+    elif pkg_ok grub-efi-amd64 || pkg_ok grub-efi-amd64-signed; then MODE=uefi
+    elif [ -n "$espdev" ]; then MODE=uefi
+    else MODE=bios; fi
+fi
+live_mode=bios; [ -d /sys/firmware/efi ] && live_mode=uefi
+
+# ---- target disk (BIOS) / ESP (UEFI) ------------------------------------------
+if [ "$MODE" = bios ]; then
+    if [ -n "$DISKARG" ]; then DISK=$DISKARG; src="--disk"
+    else
+        # what Mint itself installs to on grub updates (debconf)
+        dc=$(awk '/^Name: grub-pc\/install_devices$/{f=1} f&&/^Value:/{sub(/^Value: */,""); print; exit}' \
+             $R/var/cache/debconf/config.dat 2>/dev/null | tr ',' '\n' | awk 'NF{print $1; exit}')
+        if [ -n "$dc" ] && [ -e "$dc" ]; then DISK=$(readlink -f "$dc"); src="Mint debconf ($dc)"
+        else DISK=/dev/$(lsblk -no PKNAME "$ROOT" | head -1); src="disk holding $ROOT"; fi
+    fi
+    [ -b "$DISK" ] && [ "$(lsblk -dno TYPE "$DISK")" = disk ] || die "$DISK is not a whole disk"
+    pt=$(blkid -o value -s PTTYPE "$DISK" || true)
+    if [ "$pt" = gpt ] && ! sfdisk -d "$DISK" | grep -ci 21686148-6449-6E6F-744E-656564454649 >/dev/null; then
+        die "$DISK is GPT without a bios_grub partition -- BIOS GRUB cannot be installed there"
+    fi
+    target="MBR of $DISK ($(lsblk -dno MODEL,SIZE "$DISK" | xargs)) [from $src]"
+else
+    [ -n "$espdev" ] || die "UEFI mode but no /boot/efi in $ROOT's fstab"
+    target="ESP $espdev"
+    [ "$live_mode" = uefi ] || warn "live USB booted BIOS: cannot write EFI boot entries; installing to the fallback path too"
+fi
+
+gi_missing=
+[ -x $R/usr/sbin/grub-install ] || gi_missing=1
+[ "$MODE" = bios ] && [ ! -d $R/usr/lib/grub/i386-pc ] && gi_missing=1
+[ "$MODE" = uefi ] && [ ! -d $R/usr/lib/grub/x86_64-efi ] && [ ! -d $R/usr/lib/grub/x86_64-efi-signed ] && gi_missing=1
+[ -n "$gi_missing" ] && REINSTALL=1
+kernels=$(ls $R/boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | tr '\n' ' ')
+
+cat <<EOF
+
+  system      $name on $ROOT${bootdev:+ (+/boot $bootdev)}
+  boot mode   $MODE (live USB booted $live_mode)
+  install to  $target
+  kernels     ${kernels:-NONE FOUND}
+  actions     dpkg --configure -a${REINSTALL:+, reinstall grub packages${gi_missing:+ (grub files missing)}}${INITRAMFS:+, rebuild initramfs}${NOMODESET:+, add nomodeset} , grub-install, update-grub
+EOF
+[ -n "$kernels" ] || warn "no kernels in /boot -- GRUB will have nothing to boot; reinstall a linux-image package first"
+[ -z "$DRY" ] || { echo; echo "Dry run: nothing written."; exit 0; }
+
+# ---- repair -----------------------------------------------------------------
+[ "$MODE" = uefi ] && do_mount "$espdev" $R/boot/efi
+chroot_mounts $R
+rc=/etc/resolv.conf
+if [ -L "$R$rc" ]; then t=$(readlink "$R$rc"); case $t in /*) ;; *) t=/etc/$t ;; esac
+    rc=$(realpath -ms "$t"); mkdir -p "$R$(dirname "$rc")"; fi
+cp -L /etc/resolv.conf "$R$rc" 2>/dev/null || true
+inr() { chroot $R /usr/bin/env DEBIAN_FRONTEND=noninteractive LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin "$@"; }
+
+log "finishing any half-configured packages"
+inr dpkg --configure -a || warn "dpkg --configure -a reported errors (continuing)"
+if [ -n "$REINSTALL" ]; then
+    if [ "$MODE" = bios ]; then pk="grub-pc grub-pc-bin grub-common grub2-common os-prober"
+    else pk="grub-efi-amd64 grub-efi-amd64-bin grub-common grub2-common os-prober"
+         pkg_ok shim-signed && pk="$pk shim-signed grub-efi-amd64-signed"; fi
+    log "reinstalling: $pk"
+    inr apt-get update -qq || warn "apt-get update failed (no network?)"
+    # grub-pc's postinst would ask for a device: pre-answer with ours
+    [ "$MODE" = bios ] && printf 'grub-pc grub-pc/install_devices multiselect %s\n' "$DISK" | inr debconf-set-selections
+    inr apt-get -y -o Dpkg::Options::=--force-confold install --reinstall $pk
+fi
+if [ -n "$NOMODESET" ]; then
+    g=$R/etc/default/grub
+    grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=.*nomodeset' "$g" || \
+        sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 nomodeset"/' "$g"
+    log "kernel command line: $(grep '^GRUB_CMDLINE_LINUX_DEFAULT' "$g")"
+fi
+if [ -n "$INITRAMFS" ]; then log "rebuilding initramfs"; inr update-initramfs -u -k all; fi
+
+log "grub-install ($MODE)"
+if [ "$MODE" = bios ]; then
+    inr grub-install --target=i386-pc --recheck "$DISK"
+    # keep future grub-pc updates pointed at the same disk, by stable id
+    id=$(find -L /dev/disk/by-id -samefile "$DISK" 2>/dev/null | grep -v -- '-part' | sort | head -1)
+    printf 'grub-pc grub-pc/install_devices multiselect %s\n' "${id:-$DISK}" | inr debconf-set-selections
+    printf 'grub-pc grub-pc/install_devices_empty boolean false\n' | inr debconf-set-selections
+else
+    bid=ubuntu; [ -d $R/boot/efi/EFI/ubuntu ] || { [ -d $R/boot/efi/EFI/linuxmint ] && bid=linuxmint; }
+    if [ "$live_mode" = uefi ]; then
+        # grub-install moves its entry to the front of BootOrder; if something
+        # else (e.g. rEFInd on zmc2) was first, keep it first.
+        order=$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p')
+        inr grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=$bid --recheck
+        first=${order%%,*}
+        if [ -n "$first" ] && ! efibootmgr -v | grep -E "^Boot$first" | grep -qiE "\\\\EFI\\\\$bid\\\\"; then
+            new=$(efibootmgr | sed -n 's/^BootOrder: //p')
+            efibootmgr -q -o "$first,$(tr ',' '\n' <<<"$new" | grep -vx "$first" | paste -sd,)"
+            log "kept Boot$first ($(efibootmgr | grep "^Boot$first" | cut -c10-)) first in the firmware order"
+        fi
+    else
+        inr grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=$bid --no-nvram
+        inr grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --no-nvram
+    fi
+fi
+log "update-grub"
+inr update-grub
+
+echo
+echo "Menu now:"
+grep -E "^(menuentry|submenu) " $R/boot/grub/grub.cfg | sed -E "s/^(menuentry|submenu) '([^']*)'.*/  \1  \2/"
+if [ -x $R/etc/grub.d/25_m2d_debian ] || blkid -L "$M2D_LABEL" >/dev/null 2>&1; then
+    echo
+    echo "Note: this is an m2d dual-boot.  Mint's GRUB owns the boot now; Debian is in its menu."
+    echo "      To give the boot back to Debian: on Debian run  grub-install <disk> && update-grub"
+fi
+log "done -- remove the USB (or pick the disk in the BIOS boot menu) and reboot"
