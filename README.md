@@ -36,6 +36,9 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
 | `m2d-fix-grub` | Rescue: reinstall and regenerate Mint's GRUB from the stick. No survey needed |
 | `m2d-update` | Updates the toolkit on the stick from GitHub over HTTPS. `hosts/` is kept |
 | `m2d-next` | From the stick: find the GRUB that boots the machine, list its menu, set the next boot |
+| `m2d-win` | Fresh Debian beside Windows on UEFI (no Mint): survey, format, install, user, GRUB |
+| `windows/seed.ps1` | Run on Windows: writes the host seed for `m2d win` to the stick |
+| `windows/boot-debian.ps1` | Run on Windows (elevated): boot Debian once |
 | `lib.sh` | Shared helpers: state, mounts, chroot, apt |
 | `pkgmap.txt` | Mint/Ubuntu to Debian package name map, with `-` meaning drop |
 
@@ -123,6 +126,59 @@ then "Linux Mint … (Mint boot menu)". Then check the reports in
 - `packages-skipped.txt` lists what couldn't be carried over.
 - `etc-review.txt` lists modified or unowned `/etc` files that weren't copied.
 - `mint-thirdparty-repos.txt` lists third-party repos, which are not migrated.
+
+## Windows machines: `m2d win`
+
+`m2d win` installs a fresh Debian next to Windows on a UEFI machine. There is
+no Mint, so nothing is split or migrated. Debian goes into an empty partition,
+or into unallocated space that you free in Windows Disk Management. Either
+must be at least 20 GiB and sit on the same disk as an NTFS drive that you
+name. An existing partition is used only if it's empty.
+
+1. On Windows, with the stick plugged in (no elevation needed):
+
+       powershell -ExecutionPolicy Bypass -File windows\seed.ps1 -Stick E: -Sibling G `
+           -AuthorizedKeys $HOME\.ssh\id_ed25519.pub
+
+   This writes `debi\hosts\<COMPUTERNAME>\seed.env` to the stick's FAT
+   partition. The seed holds the hostname, the user, the time zone, the
+   locale, the desktop, and the serial of every NTFS volume. No password goes
+   on the stick.
+2. Boot the stick in **UEFI** mode from the firmware boot menu. As root, run:
+
+       m2d update               # picks up m2d-win
+       m2d win                  # plan only: target, ESP, NTFS mounts, boot order
+       m2d win --yes            # partition/format, debootstrap, user, GRUB
+
+   It asks for the Debian password at the console. `M2D_HOST=<name>` picks a
+   seed when the stick carries several. `--step win-boot` (or any other step)
+   reruns one step.
+3. Remove the stick and reboot.
+
+What you get:
+- GRUB goes on the **Windows ESP** as `EFI/debian` (shim, so it boots with
+  Secure Boot on). Windows stays first in the firmware BootOrder, with Debian
+  second. `--default debian` reverses that.
+  - From Windows, boot Debian once with `windows\boot-debian.ps1 -Reboot` from
+    an elevated shell.
+  - From Debian, use `win-bootctl next|default windows|debian`.
+
+  Debian's grub is told not to reorder NVRAM on its own updates.
+- Windows NTFS drives are mounted at `/mnt/c`, `/mnt/d` and so on, the same
+  paths WSL uses, with `ntfs3,nofail`. They are **read-only** because
+  Windows Fast Startup leaves them hibernated. Pass `--ntfs-rw` only after an
+  elevated `powercfg /h off`.
+- The RTC is kept in local time (`/etc/adjtime` LOCAL) to match Windows.
+- There is an 8 GiB `/swapfile`, and `qemu-utils` is installed. A WSL
+  `ext4.vhdx` on an NTFS drive can be opened read-only with
+  `qemu-nbd -r -c /dev/nbd0 .../ext4.vhdx`.
+- A record (state, efibootmgr before/after, the partition table before a
+  partition was created) is copied back to the stick, to
+  `debi\hosts\<host>\`, where Windows can read it.
+
+`wsl --mount` puts a whole physical disk offline in Windows. If the WSL
+distro's vhdx lives on the same disk as the Debian partition, WSL can't mount
+that partition, but Debian can still read the vhdx.
 
 ## Updating the toolkit on the stick
 
