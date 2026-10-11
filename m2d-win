@@ -19,6 +19,9 @@
 # read-only (/mnt/c, /mnt/d, ... as in WSL) unless --ntfs-rw is given, which
 # is only safe once Fast Startup is off (elevated: powercfg /h off).
 . "$(dirname "$(readlink -f "$0")")/lib.sh"
+# Unattended runs only have the log: never die under set -e without a word.
+set -E
+trap 'echo "m2d-win: failed (status $?) at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 YES= TARGET_ARG= DESKTOP= DEFAULT=windows NTFS_RW= ONLY=
 while [ $# -gt 0 ]; do
@@ -87,8 +90,17 @@ ntfs_letter() {   # ntfs_letter DEV -> C/D/... from the seed's volume serials
     [ -n "$u" ] || return 0
     for l in $SEED_NTFS; do       # "C:9ACC2D6C D:..." (vol's serial, no dash)
         s=${l#*:}
-        [ "${u: -8}" = "$s" ] && { echo "${l%%:*}"; return; }
+        [ "${u: -8}" = "$s" ] && { echo "${l%%:*}"; return 0; }
     done
+    return 0    # no match (e.g. the Recovery partition): empty, not a failure
+}
+unused_part() {   # unused_part DEV -- no filesystem at all, or our own empty deb13root
+    # Never an empty NTFS/FAT volume: an empty drive with a letter is still
+    # the user's drive (and NTFS serials can collide).  Name those --target.
+    local t
+    t=$(blkid -p -o value -s TYPE "$1" 2>/dev/null || true)
+    [ -z "$t" ] && return 0
+    [ "$t" = ext4 ] && [ "$(blkid -p -o value -s LABEL "$1" 2>/dev/null || true)" = "$M2D_LABEL" ] && fs_empty "$1"
 }
 
 if run_step win-survey; then
@@ -112,23 +124,26 @@ if run_step win-survey; then
     [ "$free" -ge 12 ] || die "ESP $esp has only ${free} MiB free; shim+GRUB need ~12"
 
     # Target: --target, else on the disk holding the seed's
-    # SEED_TARGET_SIBLING NTFS volume (G: on P620A): one empty partition of
-    # 20 GiB or more, or failing that the largest free region of 20 GiB or
-    # more, where win-format creates the partition.
+    # SEED_TARGET_SIBLING NTFS volume (G: on P620A): one partition of 20 GiB
+    # or more with no filesystem (or our own empty deb13root), or failing
+    # that the largest free region of 20 GiB or more, where win-format
+    # creates the partition.
     tgt= free_start= free_size=
     if [ -n "$TARGET_ARG" ]; then tgt=$TARGET_ARG
     else
         sib=
         for p in $(lsblk -lnpo NAME,FSTYPE | awk '$2=="ntfs"{print $1}'); do
-            [ "$(ntfs_letter "$p")" = "${SEED_TARGET_SIBLING:-}" ] && sib=$p
+            [ "$(ntfs_letter "$p")" = "${SEED_TARGET_SIBLING:-}" ] && sib="$sib $p"
         done
+        sib=${sib# }
         [ -n "$sib" ] || die "can't find the ${SEED_TARGET_SIBLING:-?}: volume; pass --target"
+        [ "$(wc -w <<<"$sib")" = 1 ] || die "several partitions carry ${SEED_TARGET_SIBLING}:'s serial ($sib); pass --target"
         disk=/dev/$(lsblk -no PKNAME "$sib")
         cands=
         for p in $(lsblk -lnpo NAME,TYPE "$disk" | awk '$2=="part"{print $1}'); do
             [ "$p" = "$sib" ] && continue
             [ "$(( $(blockdev --getsize64 "$p") >> 30 ))" -ge 20 ] || continue   # skips MSR
-            fs_empty "$p" && cands="$cands $p"
+            unused_part "$p" && cands="$cands $p"
         done
         case $(wc -w <<<"$cands") in
             1) tgt=${cands# } ;;
@@ -143,6 +158,8 @@ if run_step win-survey; then
     if [ -n "$tgt" ]; then
         [ -b "$tgt" ] || die "$tgt is not a block device"
         findmnt -S "$tgt" >/dev/null && die "$tgt is mounted"
+        l=$(ntfs_letter "$tgt")
+        [ -z "$l" ] || die "$tgt is Windows drive $l: (serial in the seed); refusing"
         if ! fs_empty "$tgt"; then
             [ "$(blkid -o value -s LABEL "$tgt")" = "$M2D_LABEL" ] && step_done win-format \
                 || die "$tgt is not empty and not ours; refusing to format it"
@@ -202,6 +219,8 @@ if run_step win-format; then
         set_state DEB_DEV "$new"
         set_state DEB_PARTN "$(cat "/sys/class/block/$(basename "$new")/partition")"
     fi
+    l=$(ntfs_letter "$DEB_DEV")
+    [ -z "$l" ] || die "$DEB_DEV is Windows drive $l:; refusing"
     fs_empty "$DEB_DEV" || [ "$(blkid -o value -s LABEL "$DEB_DEV")" = "$M2D_LABEL" ] \
         || die "$DEB_DEV is no longer empty; refusing"
     log "formatting $DEB_DEV as ext4 ($M2D_LABEL)"
