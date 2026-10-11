@@ -15,6 +15,7 @@ MEDIUM=/run/live/medium
 A=$MEDIUM/debi/auto
 W=/root/debi
 LOG=/root/m2d-auto.log
+: > "$LOG"                  # /root survives reboots on a persistence stick
 exec > >(tee -a "$LOG") 2>&1
 
 mode=$(tr -d ' \r\n' < "$A/mode" 2>/dev/null || true)
