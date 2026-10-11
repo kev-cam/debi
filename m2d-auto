@@ -1,0 +1,81 @@
+#!/bin/bash
+# m2d-auto -- unattended 'm2d win' for headless machines.
+# Started at boot by m2d-auto-hook (a live-config hook), which the stick's
+# "debi auto" boot entry passes as hooks=file://...; windows/stick-auto.ps1
+# sets that up from Windows.
+#   reads   <stick>/debi/auto/mode       plan | yes   (anything else: idle)
+#   writes  <stick>/debi/auto/out/<mode>-<time>.log  and hosts/<host>/ state
+# Only acts when the seed's SEED_TARGET_SIBLING NTFS volume is in this
+# machine, so the stick can boot elsewhere without touching anything.  When
+# done it sets the firmware's BootNext to Windows Boot Manager and reboots.
+# The mode then becomes planned / done / failed, so a later boot of the stick
+# is inert; after a successful 'yes' the stick's boot menu is restored.
+set -uo pipefail
+MEDIUM=/run/live/medium
+A=$MEDIUM/debi/auto
+W=/root/debi
+LOG=/root/m2d-auto.log
+exec > >(tee -a "$LOG") 2>&1
+
+mode=$(tr -d ' \r\n' < "$A/mode" 2>/dev/null || true)
+case $mode in plan|yes) ;; *) echo "m2d-auto: mode '${mode:-none}': nothing to do"; exit 0 ;; esac
+echo "m2d-auto: mode $mode, $(date)"
+
+# ---- is this the seeded machine? ------------------------------------------
+host=
+for s in "$MEDIUM"/debi/hosts/*/seed.env; do
+    [ -f "$s" ] || continue
+    sib=$( . "$s"; for v in $SEED_NTFS; do [ "${v%%:*}" = "$SEED_TARGET_SIBLING" ] && echo "${v#*:}"; done )
+    [ -n "$sib" ] || continue
+    if blkid -t TYPE=ntfs -o value -s UUID | tr a-f A-F | grep -q "$sib\$"; then
+        host=$(basename "$(dirname "$s")"); break
+    fi
+done
+[ -n "$host" ] || { echo "m2d-auto: no seeded host matches this machine; idle"; exit 0; }
+echo "m2d-auto: this is $host"
+
+finish() {   # finish NEWMODE -- save state + log to the stick, boot Windows
+    mount -o remount,rw "$MEDIUM" || true
+    mkdir -p "$A/out" "$MEDIUM/debi/hosts/$host"
+    [ -d "$W/hosts/$host" ] && cp -f "$W/hosts/$host"/* "$MEDIUM/debi/hosts/$host/" 2>/dev/null
+    echo "$1" > "$A/mode"
+    if [ "$1" = done ]; then
+        for f in grub.cfg config.cfg; do
+            [ -f "$MEDIUM/boot/grub/$f.debi-orig" ] && cp -f "$MEDIUM/boot/grub/$f.debi-orig" "$MEDIUM/boot/grub/$f"
+        done
+        echo "m2d-auto: stick boot menu restored"
+    fi
+    win=$(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} Windows Boot Manager.*/\1/p' | head -1)
+    [ -n "$win" ] && efibootmgr -q -n "$win" && echo "m2d-auto: BootNext=$win (Windows)"
+    echo "m2d-auto: $1, rebooting $(date)"
+    cp -f "$LOG" "$A/out/$mode-$(date +%Y%m%d-%H%M%S).log"
+    sync; mount -o remount,ro "$MEDIUM" 2>/dev/null || true
+    systemctl reboot
+    exit 0
+}
+
+# ---- network + tools -------------------------------------------------------
+for i in $(seq 60); do getent hosts deb.debian.org >/dev/null && break; sleep 5; done
+getent hosts deb.debian.org >/dev/null || { echo "m2d-auto: no network after 5 min"; finish failed; }
+if ! grep -rqsE '^(deb |URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+    printf 'deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware\n' > /etc/apt/sources.list
+fi
+apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    debootstrap efibootmgr openssh-server dosfstools >/dev/null \
+    || { echo "m2d-auto: apt-get install failed"; finish failed; }
+# sshd, so a stalled run can be looked at (live user: user / live)
+systemctl start ssh 2>/dev/null || true
+echo "m2d-auto: live session at $(hostname -I)"
+
+# ---- run m2d win from a RAM copy, with the stick's saved state ---------------
+rm -rf "$W"; cp -r "$MEDIUM/debi/toolkit" "$W"; chmod +x "$W"/m2d*
+mkdir -p "$W/hosts"; cp -r "$MEDIUM/debi/hosts/$host" "$W/hosts/"
+args=; [ "$mode" = yes ] && args=--yes
+if M2D_HOST=$host "$W/m2d-win" $args </dev/null; then
+    if [ "$mode" = plan ]; then finish planned
+    elif grep -qx win-boot "$W/hosts/$host/steps.done"; then finish done
+    else finish failed; fi
+else
+    echo "m2d-auto: m2d-win failed"
+    finish failed
+fi

@@ -95,7 +95,7 @@ if run_step win-survey; then
     [ -d /sys/firmware/efi ] || die "the live session booted BIOS; boot the stick in UEFI mode (Windows is UEFI)"
     command -v efibootmgr >/dev/null || die "efibootmgr missing (go.sh installs it)"
     live_src=$(findmnt -no SOURCE "$MEDIUM" 2>/dev/null || true)
-    live_disk=; [ -n "$live_src" ] && live_disk=$(lsblk -no PKNAME "$live_src" | head -1)
+    live_disk=; [ -b "$live_src" ] && live_disk=$(lsblk -no PKNAME "$live_src" | head -1)
 
     # Windows ESP: the vfat partition holding the Windows boot manager.
     esp=
@@ -326,9 +326,12 @@ if run_step win-users; then
         in_target chown -R "$u:$u" "/home/$u/.ssh"
     fi
     rm -f "$HOSTDIR/.keys"
-    # No password hash is carried on the stick.  Ask at the console; else the
-    # account is ssh-key only until 'passwd' is run.
-    if in_target passwd -S "$u" | awk '{exit !($2=="L"||$2=="NP")}'; then
+    # SEED_PASSWORD is for throwaway install passwords only (installer/
+    # installer, changed afterwards).  Otherwise ask at the console; with no
+    # console the account is ssh-key only until 'passwd' is run.
+    if [ -n "${SEED_PASSWORD:-}" ]; then
+        echo "$u:$SEED_PASSWORD" | in_target chpasswd
+    elif in_target passwd -S "$u" | awk '{exit !($2=="L"||$2=="NP")}'; then
         if [ -t 0 ]; then
             echo "Set the Debian password for $u:"
             until in_target passwd "$u"; do :; done

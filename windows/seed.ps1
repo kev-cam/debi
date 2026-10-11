@@ -6,8 +6,9 @@
 #
 # Writes <Stick>\debi\hosts\<COMPUTERNAME>\seed.env (+ authorized_keys) on the
 # live stick's FAT partition; the live session sees it under
-# /run/live/medium/debi and m2d-win imports it.  Nothing secret goes on the
-# stick: the Debian password is asked at the console during 'm2d win'.
+# /run/live/medium/debi and m2d-win imports it.  The Debian password is asked
+# at the console during 'm2d win', unless -Password gives a throwaway one
+# (headless installs); that one is stored in clear on the stick.
 #
 # -Sibling names the NTFS drive that shares a disk with the space meant for
 # Debian (the empty partition, or free space, is found next to it).  Every
@@ -21,7 +22,10 @@ param(
     [string[]] $AuthorizedKeys = @(),
     [ValidateSet('cinnamon', 'mate', 'xfce', 'none')] [string] $Desktop = 'cinnamon',
     [string]   $Tz = '',
-    [string]   $Kbd = 'us'
+    [string]   $Kbd = 'us',
+    # Throwaway install password (e.g. installer), for headless installs.
+    # Leave empty to be asked at the console instead.
+    [string]   $Password = ''
 )
 $ErrorActionPreference = 'Stop'
 $Stick = $Stick.TrimEnd('\', ':') + ':'
@@ -69,7 +73,7 @@ $seed = @(
     "SEED_DESKTOP=$Desktop"
     "SEED_TARGET_SIBLING=$Sibling"
     "SEED_NTFS=`"$($ntfs -join ' ')`""
-) -join "`n"
+) + $(if ($Password) { @("SEED_PASSWORD='$($Password -replace "'", '')'") } else { @() }) -join "`n"
 # LF endings: bash sources this file
 [IO.File]::WriteAllText((Join-Path $dir 'seed.env'), $seed + "`n")
 

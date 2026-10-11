@@ -1,0 +1,19 @@
+#!/bin/sh
+# m2d-auto-hook -- live-config hook: start m2d-auto once the network is up.
+# The stick's "debi auto" boot entry passes
+#   hooks=file:///run/live/medium/debi/toolkit/m2d-auto-hook
+# live-config runs it early in boot, so it only queues a service.
+cat > /etc/systemd/system/m2d-auto.service <<'EOF'
+[Unit]
+Description=debi: unattended m2d win (m2d-auto)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /run/live/medium/debi/toolkit/m2d-auto
+StandardOutput=journal+console
+TimeoutStartSec=infinity
+EOF
+systemctl daemon-reload
+systemctl --no-block start m2d-auto.service

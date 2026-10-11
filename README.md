@@ -39,6 +39,9 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
 | `m2d-win` | Fresh Debian beside Windows on UEFI (no Mint): survey, format, install, user, GRUB |
 | `windows/seed.ps1` | Run on Windows: writes the host seed for `m2d win` to the stick |
 | `windows/boot-debian.ps1` | Run on Windows (elevated): boot Debian once |
+| `m2d-auto`, `m2d-auto-hook` | Headless: run `m2d win` unattended from the stick, then reboot to Windows |
+| `windows/stick-auto.ps1` | Run on Windows: set the stick to run `m2d win` (plan/yes) on its next boot |
+| `windows/reboot-to-usb.ps1` | Run on Windows (elevated): boot the stick once via a firmware entry |
 | `lib.sh` | Shared helpers: state, mounts, chroot, apt |
 | `pkgmap.txt` | Mint/Ubuntu to Debian package name map, with `-` meaning drop |
 
@@ -175,6 +178,39 @@ What you get:
 - A record (state, efibootmgr before/after, the partition table before a
   partition was created) is copied back to the stick, to
   `debi\hosts\<host>\`, where Windows can read it.
+
+### Headless Windows machines
+
+When nobody is at the console, the stick can run `m2d win` by itself and then
+reboot into Windows:
+
+    powershell -ExecutionPolicy Bypass -File windows\seed.ps1 -Stick E: -Sibling G -User installer -Password installer
+    powershell -ExecutionPolicy Bypass -File windows\stick-auto.ps1 -Stick E: -Mode plan
+    # elevated:
+    powershell -ExecutionPolicy Bypass -File windows\reboot-to-usb.ps1 -Stick E:
+
+- `stick-auto.ps1` copies the toolkit to `debi\toolkit` on the stick. It adds
+  a first boot entry with a 5 s timeout, which passes the `m2d-auto-hook`
+  live-config hook (`hooks=file://...`), and writes the mode to
+  `debi\auto\mode`. The stick's original `grub.cfg` and `config.cfg` are
+  kept as `*.debi-orig`.
+- `reboot-to-usb.ps1` creates a firmware entry, "debi USB", from a copy of
+  `{bootmgr}`. The entry points at the stick's `\EFI\boot\bootx64.efi`, which
+  is shim, so Secure Boot is fine. The script makes it the one-shot boot
+  sequence and restarts.
+- In the live session, `m2d-auto` waits for the network, installs
+  debootstrap, efibootmgr and sshd, and runs `m2d win` (with `--yes` in `yes`
+  mode). It writes `debi\auto\out\<mode>-<time>.log` and
+  `debi\hosts\<host>\`. It then sets BootNext to Windows Boot Manager and
+  reboots. The mode becomes `planned`, `done` or `failed`, so booting the
+  stick again does nothing. After `done`, the stick's own menu is restored.
+- It acts only if the seed's `-Sibling` NTFS volume is present, so the same
+  stick can boot other machines safely.
+- Read the plan log, then run `stick-auto.ps1 -Mode yes` and
+  `reboot-to-usb.ps1` again. `-Mode off` restores the stick by hand.
+- While it runs, the live session has sshd (user `user`, password `live`).
+- `-Password` stores a throwaway password in clear on the stick. Change it
+  after the first login.
 
 `wsl --mount` puts a whole physical disk offline in Windows. If the WSL
 distro's vhdx lives on the same disk as the Debian partition, WSL can't mount
