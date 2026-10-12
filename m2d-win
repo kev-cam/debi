@@ -381,7 +381,24 @@ if run_step win-boot; then
     setg() { if grep -q "^$1=" "$dg"; then sed -i "s|^$1=.*|$1=$2|" "$dg"; else echo "$1=$2" >> "$dg"; fi; }
     setg GRUB_TIMEOUT 5
     setg GRUB_TIMEOUT_STYLE menu
-    setg GRUB_DISABLE_OS_PROBER false
+    # os-prober found nothing in the install chroot on P620A, so Debian's menu
+    # had no way back to Windows.  Write the Windows entry ourselves (the ESP
+    # by UUID) and keep os-prober out of it, so it doesn't add a duplicate.
+    setg GRUB_DISABLE_OS_PROBER true
+    cat > "$TARGET/etc/grub.d/25_m2d_windows" <<EOF
+#!/bin/sh
+# m2d-win: chainload Windows Boot Manager from the shared ESP
+cat <<'CFG'
+menuentry 'Windows Boot Manager' --class windows --class os --id m2d-windows {
+	insmod part_gpt
+	insmod fat
+	insmod chain
+	search --no-floppy --fs-uuid --set=root $ESP_UUID
+	chainloader /EFI/Microsoft/Boot/bootmgfw.efi
+}
+CFG
+EOF
+    chmod +x "$TARGET/etc/grub.d/25_m2d_windows"
 
     log "installing shim + GRUB as EFI/debian on $ESP_DEV"
     in_target grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=debian

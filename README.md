@@ -19,6 +19,7 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
 |---------|------|------|------|-----------|-------|
 | mediapc | 21.3 MATE | BIOS | GPT | `sda7` | MythTV backend, second data disk |
 | zmc2    | 22.2 Cinnamon | UEFI via rEFInd | MBR | `sda5`, last logical | `/swapfile`, grub-pc and grub-efi both installed |
+| P620A   | none (Windows 11) | UEFI | GPT | none | `m2d win`, headless: fresh Debian in free space beside an NTFS data drive; Windows stays first, Debian booted with `boot-debian.sh` |
 
 ## Files
 
@@ -162,16 +163,31 @@ What you get:
 - GRUB goes on the **Windows ESP** as `EFI/debian` (shim, so it boots with
   Secure Boot on). Windows stays first in the firmware BootOrder, with Debian
   second. `--default debian` reverses that.
-  - From Windows, boot Debian once with `windows\boot-debian.ps1 -Reboot` from
-    an elevated shell.
+  - From Windows, boot Debian once with `windows\boot-debian.ps1 -Reboot`
+    from an elevated shell. Where PowerShell scripts are blocked, run the
+    Cygwin twin `windows/boot-debian.sh --reboot` from an elevated Cygwin
+    terminal. It logs every step to `/tmp/boot-debian.log`.
   - From Debian, use `win-bootctl next|default windows|debian`.
 
-  Debian's grub is told not to reorder NVRAM on its own updates.
+  Debian's grub is told not to reorder NVRAM on its own updates. Debian's own
+  menu gets a "Windows Boot Manager" entry that chainloads
+  `\EFI\Microsoft\Boot\bootmgfw.efi` from the ESP by UUID. os-prober is off,
+  because inside the install chroot it found nothing.
+- `bcdedit` appends "A device which does not exist was specified." to every
+  command while some firmware entry's device is missing. One example is
+  "debi USB" with the stick unplugged. The message is noise, and it can make
+  `bcdedit` exit 1 even though the command worked, so the boot scripts check
+  success by reading the boot sequence back.
 - Windows NTFS drives are mounted at `/mnt/c`, `/mnt/d` and so on, the same
   paths WSL uses, with `ntfs3,nofail`. They are **read-only** because
   Windows Fast Startup leaves them hibernated. Pass `--ntfs-rw` only after an
   elevated `powercfg /h off`.
-- The RTC is kept in local time (`/etc/adjtime` LOCAL) to match Windows.
+- The RTC is kept in local time (`/etc/adjtime` LOCAL) to match Windows, and
+  `systemd-timesyncd` is installed. The live session has the opposite problem:
+  it reads the local-time RTC as UTC. On P620A (Pacific time) its clock was
+  7 hours slow, and apt rejected the mirror's fresh signatures with "Not live
+  until ...". So `m2d win` and `m2d-auto` set the live clock from the
+  mirror's HTTP `Date` header before running apt. The RTC is left to Windows.
 - There is an 8 GiB `/swapfile`, and `qemu-utils` is installed. A WSL
   `ext4.vhdx` on an NTFS drive can be opened read-only with
   `qemu-nbd -r -c /dev/nbd0 .../ext4.vhdx`.
@@ -208,6 +224,13 @@ reboot into Windows:
   stick can boot other machines safely.
 - Read the plan log, then run `stick-auto.ps1 -Mode yes` and
   `reboot-to-usb.ps1` again. `-Mode off` restores the stick by hand.
+  `windows/boot-debian.sh --usb E:` does the same job as `reboot-to-usb.ps1`
+  from an elevated Cygwin terminal.
+- After an install, `-Mode diag` records the firmware entries
+  (`efibootmgr -v`), the ESP's `EFI/debian`, the Secure Boot state and
+  Debian's own boot history, then returns to Windows. `-Mode debian` does
+  the same, then boots Debian's entry with BootNext set from Linux, which
+  takes Windows' `bcdedit` out of the picture.
 - While it runs, the live session has sshd (user `user`, password `live`).
 - `-Password` stores a throwaway password in clear on the stick. Change it
   after the first login.
