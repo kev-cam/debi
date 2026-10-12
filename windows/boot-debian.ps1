@@ -15,7 +15,7 @@ foreach ($line in (bcdedit /enum firmware)) {
 }
 if (-not $deb) { throw "no 'debian' firmware entry (was m2d win run?)" }
 if ($DryRun) { Write-Output "would boot once: debian $deb"; return }
-bcdedit /set '{fwbootmgr}' bootsequence $deb | Out-Null
-if ($LASTEXITCODE) { throw "bcdedit failed ($LASTEXITCODE)" }
+$out = bcdedit /set '{fwbootmgr}' bootsequence $deb 2>&1
+if ($LASTEXITCODE) { throw "bcdedit /set {fwbootmgr} bootsequence $deb failed ($LASTEXITCODE): $out" }
 Write-Output "next boot: debian $deb"
 if ($Reboot) { shutdown /r /t 5 /c "Rebooting into Debian" }
