@@ -3,8 +3,14 @@
 # Started at boot by m2d-auto-hook (a live-config hook), which the stick's
 # "debi auto" boot entry passes as hooks=file://...; windows/stick-auto.ps1
 # sets that up from Windows.
-#   reads   <stick>/debi/auto/mode       plan | yes   (anything else: idle)
+#   reads   <stick>/debi/auto/mode       plan | yes | diag | debian
+#           (anything else: idle)
 #   writes  <stick>/debi/auto/out/<mode>-<time>.log  and hosts/<host>/ state
+#   diag    after an install: record the firmware boot entries, the ESP's
+#           EFI/debian, Secure Boot state, and Debian's own boot history,
+#           then back to Windows
+#   debian  diag, then BootNext = Debian's own firmware entry (set from Linux,
+#           so Windows' bcdedit is out of the loop) and reboot into it
 # Only acts when the seed's SEED_TARGET_SIBLING NTFS volume is in this
 # machine, so the stick can boot elsewhere without touching anything.  When
 # done it sets the firmware's BootNext to Windows Boot Manager and reboots.
@@ -19,7 +25,7 @@ LOG=/root/m2d-auto.log
 exec > >(tee -a "$LOG") 2>&1
 
 mode=$(tr -d ' \r\n' < "$A/mode" 2>/dev/null || true)
-case $mode in plan|yes) ;; *) echo "m2d-auto: mode '${mode:-none}': nothing to do"; exit 0 ;; esac
+case $mode in plan|yes|diag|debian) ;; *) echo "m2d-auto: mode '${mode:-none}': nothing to do"; exit 0 ;; esac
 echo "m2d-auto: mode $mode, $(date)"
 
 # ---- is this the seeded machine? ------------------------------------------
@@ -35,19 +41,21 @@ done
 [ -n "$host" ] || { echo "m2d-auto: no seeded host matches this machine; idle"; exit 0; }
 echo "m2d-auto: this is $host"
 
-finish() {   # finish NEWMODE -- save state + log to the stick, boot Windows
+finish() {   # finish NEWMODE [BOOTNUM] -- save state + log to the stick, then
+             # boot BOOTNUM (default: Windows Boot Manager)
     mount -o remount,rw "$MEDIUM" || true
     mkdir -p "$A/out" "$MEDIUM/debi/hosts/$host"
     [ -d "$W/hosts/$host" ] && cp -f "$W/hosts/$host"/* "$MEDIUM/debi/hosts/$host/" 2>/dev/null
     echo "$1" > "$A/mode"
-    if [ "$1" = done ]; then
+    case $1 in done|diagnosed|debian-tried)
         for f in grub.cfg config.cfg; do
             [ -f "$MEDIUM/boot/grub/$f.debi-orig" ] && cp -f "$MEDIUM/boot/grub/$f.debi-orig" "$MEDIUM/boot/grub/$f"
         done
-        echo "m2d-auto: stick boot menu restored"
-    fi
-    win=$(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} Windows Boot Manager.*/\1/p' | head -1)
-    [ -n "$win" ] && efibootmgr -q -n "$win" && echo "m2d-auto: BootNext=$win (Windows)"
+        echo "m2d-auto: stick boot menu restored" ;;
+    esac
+    next=${2:-}
+    [ -n "$next" ] || next=$(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} Windows Boot Manager.*/\1/p' | head -1)
+    [ -n "$next" ] && efibootmgr -q -n "$next" && echo "m2d-auto: BootNext=$next"
     echo "m2d-auto: $1, rebooting $(date)"
     cp -f "$LOG" "$A/out/$mode-$(date +%Y%m%d-%H%M%S).log"
     sync; mount -o remount,ro "$MEDIUM" 2>/dev/null || true
@@ -66,11 +74,41 @@ if ! grep -rqsE '^(deb |URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d/; 
     printf 'deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware\n' > /etc/apt/sources.list
 fi
 apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    debootstrap efibootmgr openssh-server dosfstools >/dev/null \
+    debootstrap efibootmgr openssh-server dosfstools mokutil >/dev/null \
     || { echo "m2d-auto: apt-get install failed"; finish failed; }
 # sshd, so a stalled run can be looked at (live user: user / live)
 systemctl start ssh 2>/dev/null || true
 echo "m2d-auto: live session at $(hostname -I)"
+
+# ---- diag / debian: look at an installed system ------------------------------
+if [ "$mode" = diag ] || [ "$mode" = debian ]; then
+    st=$MEDIUM/debi/hosts/$host/state.env
+    esp=$(blkid -U "$(sed -n "s/^ESP_UUID=//p" "$st" | tr -d "'")" 2>/dev/null || true)
+    deb=$(blkid -U "$(sed -n "s/^DEB_UUID=//p" "$st" | tr -d "'")" 2>/dev/null || true)
+    echo "== ESP ${esp:-NOT FOUND}, Debian root ${deb:-NOT FOUND}"
+    echo "== efibootmgr -v"; efibootmgr -v
+    echo "== Secure Boot"; mokutil --sb-state 2>&1
+    mkdir -p /mnt/d-esp /mnt/d-root
+    if [ -n "$esp" ] && mount -o ro "$esp" /mnt/d-esp; then
+        echo "== ESP EFI/"; ls -la /mnt/d-esp/EFI
+        echo "== ESP EFI/debian"; ls -la /mnt/d-esp/EFI/debian
+        echo "== EFI/debian/grub.cfg"; cat /mnt/d-esp/EFI/debian/grub.cfg
+        echo "== EFI/debian/BOOTX64.CSV"; iconv -f UTF-16 /mnt/d-esp/EFI/debian/BOOTX64.CSV 2>/dev/null
+        umount /mnt/d-esp
+    fi
+    if [ -n "$deb" ] && mount -o ro "$deb" /mnt/d-root; then
+        echo "== Debian /boot"; ls -la /mnt/d-root/boot
+        echo "== Debian grub menu"; grep -E "^\s*(menuentry|submenu|search|linux|set (default|timeout))" /mnt/d-root/boot/grub/grub.cfg | head -20
+        echo "== Debian boots (journal)"; journalctl -D /mnt/d-root/var/log/journal --list-boots 2>&1 | tail -5
+        echo "== Debian /var/log newest"; ls -lt /mnt/d-root/var/log | head -8
+        umount /mnt/d-root
+    fi
+    if [ "$mode" = diag ]; then finish diagnosed; fi
+    debnum=$(efibootmgr | sed -n 's/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} debian\t.*/\1/p; s/^Boot\([0-9A-F]\{4\}\)\*\{0,1\} debian$/\1/p' | head -1)
+    [ -n "$debnum" ] || { echo "m2d-auto: no 'debian' firmware entry"; finish failed; }
+    echo "m2d-auto: booting Debian's own entry Boot$debnum next"
+    finish debian-tried "$debnum"
+fi
 
 # ---- run m2d win from a RAM copy, with the stick's saved state ---------------
 rm -rf "$W"; cp -r "$MEDIUM/debi/toolkit" "$W"; chmod +x "$W"/m2d*

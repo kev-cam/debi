@@ -1,16 +1,18 @@
-# stick-auto.ps1 -Stick E: -Mode plan|yes|off   (no elevation)
+# stick-auto.ps1 -Stick E: -Mode plan|yes|diag|debian|off   (no elevation)
 # Make the live stick run 'm2d win' unattended on its next boot (headless
 # machines).  Copies this toolkit to <Stick>\debi\toolkit, adds a first boot
 # entry "debi auto" to the stick's GRUB menu with a 5 s timeout, passing the
 # m2d-auto live-config hook, and writes the mode to <Stick>\debi\auto\mode:
 #   plan  survey only; the plan lands in debi\auto\out\plan-*.log
 #   yes   partition/format/install/users/boot, log in debi\auto\out\yes-*.log
+#   diag  record firmware entries, ESP, Secure Boot and Debian's boot history
+#   debian  diag, then boot Debian's own firmware entry (BootNext set from Linux)
 #   off   restore the stick's own boot menu
 # Either way the live session then reboots into Windows.  Needs a seed
 # (seed.ps1).  windows\reboot-to-usb.ps1 (elevated) boots the stick once.
 param(
     [Parameter(Mandatory)] [string] $Stick,
-    [Parameter(Mandatory)] [ValidateSet('plan', 'yes', 'off')] [string] $Mode
+    [Parameter(Mandatory)] [ValidateSet('plan', 'yes', 'diag', 'debian', 'off')] [string] $Mode
 )
 $ErrorActionPreference = 'Stop'
 $Stick = $Stick.TrimEnd('\', ':') + ':'
