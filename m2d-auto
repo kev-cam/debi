@@ -58,6 +58,10 @@ finish() {   # finish NEWMODE -- save state + log to the stick, boot Windows
 # ---- network + tools -------------------------------------------------------
 for i in $(seq 60); do getent hosts deb.debian.org >/dev/null && break; sleep 5; done
 getent hosts deb.debian.org >/dev/null || { echo "m2d-auto: no network after 5 min"; finish failed; }
+# The RTC holds Windows' local time, read here as UTC: fix the clock before apt
+# checks signatures (m2d-win does the same for a console run).
+d=$(curl -sI --max-time 15 http://deb.debian.org/debian/ | sed -n 's/^[Dd]ate: //p' | tr -d '\r')
+[ -n "$d" ] && date -s "$d" >/dev/null && echo "m2d-auto: clock set: $(date -u)"
 if ! grep -rqsE '^(deb |URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d/; then
     printf 'deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware\n' > /etc/apt/sources.list
 fi

@@ -238,6 +238,14 @@ fi
 # ---- win-install -----------------------------------------------------------------
 if run_step win-install; then
     command -v debootstrap >/dev/null || die "debootstrap missing (go.sh installs it)"
+    # Windows keeps the RTC in local time and the live session reads it as
+    # UTC, so its clock can be hours slow, and apt then rejects fresh
+    # signatures as "not live until ...".  Take the time from the mirror's
+    # HTTP Date header (plain http: TLS would need the clock).  The RTC is
+    # left alone because Windows owns it.
+    d=$(curl -sI --max-time 15 "$M2D_MIRROR/" 2>/dev/null | sed -n 's/^[Dd]ate: //p' | tr -d '\r' || true)
+    if [ -n "$d" ] && date -s "$d" >/dev/null; then log "clock set from $M2D_MIRROR: $(date -u)"
+    else warn "couldn't read the time from $M2D_MIRROR; apt may reject signatures if the clock is off"; fi
     mount_target
     if [ ! -x "$TARGET/usr/bin/apt-get" ]; then
         log "debootstrap $M2D_SUITE -> $DEB_DEV"
@@ -305,7 +313,7 @@ EOF
     tapt update
     tapt install linux-image-amd64 grub-efi-amd64 grub-efi-amd64-signed shim-signed \
         efibootmgr os-prober network-manager openssh-server sudo console-setup
-    install_best_effort base amd64-microcode intel-microcode firmware-linux firmware-linux-nonfree \
+    install_best_effort base systemd-timesyncd amd64-microcode intel-microcode firmware-linux firmware-linux-nonfree \
         firmware-misc-nonfree firmware-realtek firmware-amd-graphics firmware-iwlwifi \
         firmware-atheros firmware-brcm80211 bash-completion rsync curl wget less vim-tiny \
         man-db dosfstools ntfs-3g qemu-utils build-essential git cmake ninja-build \
