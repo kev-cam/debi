@@ -417,18 +417,37 @@ EOF
     set_state EFI_WINDOWS "${win:-}"
     log "firmware BootOrder $order (was $EFI_BOOTORDER_ORIG)"
 
-    cat > "$TARGET/usr/local/sbin/win-bootctl" <<EOF
+    # Looked up at run time by ESP path: the firmware (or Windows) can
+    # re-register the entries under new numbers and labels -- P620A came
+    # back as Boot0007 "Debian (from Windows)" -- so nothing is baked in.
+    cat > "$TARGET/usr/local/sbin/win-bootctl" <<'EOF'
 #!/bin/sh
-# win-bootctl next|default windows|debian  -- written by m2d-win
-# 'next' boots that OS once; 'default' changes the firmware BootOrder.
+# win-bootctl next|default|show [windows|debian]  -- written by m2d-win
+# 'next' boots that OS once; 'default' changes the firmware BootOrder;
+# 'show' prints what it found.  Entries are found by their ESP path on
+# every run (efibootmgr -v), never by a stored number or label.
 set -e
-deb=$deb win=${win:-}
-case \$2 in windows) n=\$win o=\$win,\$deb ;; debian) n=\$deb o=\$deb,\$win ;; *) echo "usage: \$0 next|default windows|debian" >&2; exit 2 ;; esac
-case \$1 in
-    next)    efibootmgr -q -n "\$n" && echo "next boot: \$2 (Boot\$n)" ;;
-    default) rest=\$(efibootmgr | sed -n 's/^BootOrder: //p' | tr ',' '\n' | grep -vxE "\$deb|\$win" | paste -sd, -)
-             efibootmgr -q -o "\$o\${rest:+,\$rest}" && echo "default: \$2" ;;
-    *) echo "usage: \$0 next|default windows|debian" >&2; exit 2 ;;
+EFI=${EFIBOOTMGR:-efibootmgr}
+find_entry() {  # $1 = ERE matched case-insensitively against the verbose line
+    $EFI -v | grep -iE "^Boot[0-9A-F]{4}\*?[[:space:]].*$1" | head -1 \
+        | sed 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/'
+}
+deb=$(find_entry 'File\(\\EFI\\DEBIAN\\')
+win=$(find_entry 'File\(\\EFI\\MICROSOFT\\BOOT\\BOOTMGFW\.EFI')
+[ -n "$deb" ] || { echo "no Debian firmware entry (\\EFI\\debian\\) found" >&2; exit 1; }
+[ -n "$win" ] || { echo "no Windows Boot Manager firmware entry found" >&2; exit 1; }
+case $1 in
+    show) $EFI | grep -E '^(BootCurrent|BootNext|BootOrder)'
+          echo "debian:  Boot$deb"; echo "windows: Boot$win"; exit 0 ;;
+    next|default) ;;
+    *) echo "usage: $0 next|default windows|debian | show" >&2; exit 2 ;;
+esac
+case $2 in windows) n=$win o=$win,$deb ;; debian) n=$deb o=$deb,$win ;;
+    *) echo "usage: $0 next|default windows|debian | show" >&2; exit 2 ;; esac
+case $1 in
+    next)    $EFI -q -n "$n" && echo "next boot: $2 (Boot$n)" ;;
+    default) rest=$($EFI | sed -n 's/^BootOrder: //p' | tr ',' '\n' | grep -vxE "$deb|$win" | paste -sd, -)
+             $EFI -q -o "$o${rest:+,$rest}" && echo "default: $2 (BootOrder $o${rest:+,$rest})" ;;
 esac
 EOF
     chmod +x "$TARGET/usr/local/sbin/win-bootctl"

@@ -167,7 +167,9 @@ What you get:
     from an elevated shell. Where PowerShell scripts are blocked, run the
     Cygwin twin `windows/boot-debian.sh --reboot` from an elevated Cygwin
     terminal. It logs every step to `/tmp/boot-debian.log`.
-  - From Debian, use `win-bootctl next|default windows|debian`.
+  - From Debian, use `win-bootctl next|default windows|debian` (or `win-bootctl show`).
+    It finds the two firmware entries by their ESP path on every run, so it
+    survives the firmware re-numbering or relabelling them.
 
   Debian's grub is told not to reorder NVRAM on its own updates. Debian's own
   menu gets a "Windows Boot Manager" entry that chainloads
