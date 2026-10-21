@@ -44,6 +44,7 @@ done over ssh. Per-machine state, logs and reports are kept on the stick, in
 | `windows/stick-auto.ps1` | Run on Windows: set the stick to run `m2d win` (plan/yes) on its next boot |
 | `windows/reboot-to-usb.ps1` | Run on Windows (elevated): boot the stick once via a firmware entry |
 | `lib.sh` | Shared helpers: state, mounts, chroot, apt |
+| `mount-chroot` | Standalone rescue tool: mounts an installed system, chroots into it, repairs GRUB |
 | `pkgmap.txt` | Mint/Ubuntu to Debian package name map, with `-` meaning drop |
 
 ## Making the stick
@@ -285,6 +286,45 @@ Extra options:
 
 On an m2d dual-boot, this hands the boot back to Mint's GRUB, and Debian stays
 in Mint's menu.
+
+## Repairing GRUB: `mount-chroot`
+
+`mount-chroot` mounts an installed system from the live session and chroots
+into it. It needs nothing else from the toolkit, so a copy on any rescue stick
+works. `m2d-prep-usb` links it as `/usr/local/sbin/mount-chroot`.
+Use `m2d fix-grub` for a Mint or Ubuntu system, since it also repairs
+half-configured packages and follows Mint's own debconf. Use `mount-chroot`
+for any other distribution, for LUKS or LVM roots, or when you just need a
+shell inside the installed system.
+
+    mount-chroot --dev /dev/nvme0n1 --fix-grub   # find the root on the disk, reinstall GRUB
+    mount-chroot --dev /dev/sda6                 # mount that root and open a shell in it
+    mount-chroot --list                          # every installed system on every disk
+
+Given a disk, it looks for root filesystems, meaning ones with `/etc/fstab` and
+`os-release`. It unlocks LUKS and activates LVM on the way, and asks which one
+to use if it finds more than one. It then mounts everything else in that
+system's fstab, deepest mount points last, skipping network, `noauto` and bind
+entries. Finally it binds `/dev`, `/proc`, `/sys`, `efivarfs` and a fresh
+`/run`. Everything is unmounted on exit unless `--keep` is given.
+
+`--fix-grub` decides the boot mode from the GRUB platform directories in the
+installed `/boot/grub`, the same test `m2d survey` uses. If both are present,
+it goes by how the live session booted. `--bios` or `--uefi` overrides this.
+
+- **BIOS:** it runs `grub-install` to the disk holding `/boot` and points
+  Debian/Ubuntu's `grub-pc/install_devices` at that disk.
+- **UEFI:** it runs `grub-install` to the ESP. If the live session booted in
+  BIOS mode it can't write a firmware boot entry, so it adds the
+  `EFI/BOOT/BOOTX64.EFI` fallback loader instead. `--removable` adds that
+  fallback in any case.
+
+Either way it then runs `update-grub` (`grub-mkconfig` on Arch). `--initramfs`
+also rebuilds the initramfs.
+
+On a machine converted by `m2d`, pick Debian's partition, because Debian's GRUB
+owns the boot and chains to Mint's menu. Single dashes also work
+(`mount-chroot -dev /dev/sda -fix-grub`).
 
 ## Choosing what boots next (from the live USB)
 

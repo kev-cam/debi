@@ -1,0 +1,322 @@
+#!/bin/bash
+# mount-chroot -- mount an installed Linux system from a live session, chroot
+# into it, and optionally repair its GRUB.  Standalone: needs nothing else from
+# this toolkit, so it can be copied to any rescue stick.
+#
+#   mount-chroot --dev /dev/nvme0n1 --fix-grub    find the root on the disk, reinstall GRUB
+#   mount-chroot --dev /dev/sda5                  mount that root (+ its fstab), open a shell
+#   mount-chroot --dev /dev/sda5 -- update-initramfs -u -k all
+#   mount-chroot --list [--dev /dev/sda]          show the root filesystems found
+#
+#   --dev DEV       a disk (searched for root filesystems) or the root partition itself;
+#                   without it every disk is searched.  A bare /dev/... argument works too
+#   --fix-grub      grub-install (BIOS: boot code to the disk; UEFI: to the ESP + NVRAM
+#                   entry), then update-grub / grub-mkconfig
+#   --bios|--uefi   force the boot mode instead of detecting it from the installed system
+#   --disk DISK     BIOS: disk to write the boot code to (default: the disk holding /boot)
+#   --efi-id NAME   UEFI: --bootloader-id (default: grub-install's own, from GRUB_DISTRIBUTOR)
+#   --removable     UEFI: also install the fallback loader EFI/BOOT/BOOTX64.EFI
+#   --initramfs     also rebuild the initramfs (update-initramfs, dracut or mkinitcpio)
+#   --net           give the chroot the live session's DNS (to apt install inside it)
+#   --shell         open a shell after --fix-grub or a command as well
+#   --mnt DIR       where to mount the root (default /mnt/chroot)
+#   --keep          leave everything mounted on exit;  --umount [--mnt DIR] undoes it
+# Single or double dashes both work: -dev /dev/sda -fix-grub.
+# fstab entries that are network, noauto or bind mounts are skipped; the rest
+# are mounted as the installed system would mount them.
+set -euo pipefail
+
+die()  { echo "mount-chroot: ERROR: $*" >&2; exit 1; }
+warn() { echo "mount-chroot: WARNING: $*" >&2; }
+log()  { echo "== $*" >&2; }
+usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; exit "${1:-0}"; }
+
+DEV= MNT=/mnt/chroot FIXGRUB= MODE= BDISK= EFIID= REMOVABLE= INITRAMFS= NET= SHELL_AFTER= KEEP= UMOUNT= LIST=
+CMD=()
+while [ $# -gt 0 ]; do
+    a=$1; shift
+    case $a in -[a-z]?*) a=-$a ;; esac                             # -dev -> --dev
+    case $a in --*=*) set -- "${a#*=}" "$@"; a=${a%%=*} ;; esac   # --dev=X
+    case $a in
+        --dev)       DEV=${1:?--dev needs a device}; shift ;;
+        --mnt)       MNT=${1:?--mnt needs a directory}; shift ;;
+        --disk)      BDISK=${1:?--disk needs a disk}; shift ;;
+        --efi-id)    EFIID=${1:?--efi-id needs a name}; shift ;;
+        --fix-grub)  FIXGRUB=1 ;;
+        --bios)      MODE=bios ;;
+        --uefi)      MODE=uefi ;;
+        --removable) REMOVABLE=1 ;;
+        --initramfs) INITRAMFS=1 ;;
+        --net)       NET=1 ;;
+        --shell)     SHELL_AFTER=1 ;;
+        --keep)      KEEP=1 ;;
+        --umount)    UMOUNT=1 ;;
+        --list)      LIST=1 ;;
+        -h|--help)   usage ;;
+        --)          CMD=("$@"); break ;;
+        /dev/*)      [ -z "$DEV" ] || die "two devices given: $DEV $a"; DEV=$a ;;
+        *)           echo "mount-chroot: unknown argument '$a'" >&2; usage 2 ;;
+    esac
+done
+[ "$(id -u)" = 0 ] || die "must run as root"
+MNT=${MNT%/}
+
+if [ -n "$UMOUNT" ]; then
+    mountpoint -q "$MNT" || die "$MNT is not mounted"
+    umount -R "$MNT" 2>/dev/null || { warn "busy -- detaching lazily"; umount -R -l "$MNT"; }
+    log "unmounted $MNT"; exit 0
+fi
+
+# ---- mounts, undone in reverse order on exit ---------------------------------
+MOUNTS=() OPENED_LUKS=() ACTIVATED_VGS=()
+cleanup() {
+    local i
+    if [ -n "$KEEP" ] && [ -z "$LIST" ] && mountpoint -q "$MNT"; then
+        log "left mounted at $MNT -- undo with: mount-chroot --umount --mnt $MNT"; return
+    fi
+    for ((i=${#MOUNTS[@]}-1; i>=0; i--)); do
+        umount "${MOUNTS[$i]}" 2>/dev/null || umount -l "${MOUNTS[$i]}" 2>/dev/null || true
+    done
+    for i in "${ACTIVATED_VGS[@]}"; do vgchange -an "$i" >/dev/null 2>&1 || true; done
+    for i in "${OPENED_LUKS[@]}"; do cryptsetup close "$i" 2>/dev/null || true; done
+}
+trap cleanup EXIT
+domount() {     # domount [mount opts...] src dir
+    local dir=${*: -1}
+    mkdir -p "$dir"
+    mount "$@" || return 1
+    MOUNTS+=("$dir")
+}
+
+# ---- find root filesystems -----------------------------------------------------
+# Unlock LUKS and activate LVM on the devices first, so their contents show up.
+unlock() {      # unlock DEV...
+    local p t n vg again=
+    for p in $(lsblk -rpno PATH "$@" 2>/dev/null); do
+        t=$(blkid -o value -s TYPE "$p" 2>/dev/null || true)
+        case $t in
+        crypto_LUKS)
+            [ -n "$(lsblk -rno TYPE "$p" | grep -x crypt)" ] && continue   # already open
+            n=luks-$(blkid -o value -s UUID "$p")
+            if [ -t 0 ]; then
+                log "$p is encrypted (LUKS)"
+                if cryptsetup open "$p" "$n"; then OPENED_LUKS+=("$n"); again=1
+                else warn "$p left locked"; fi
+            else warn "$p is LUKS-encrypted and there is no terminal to ask for the passphrase"; fi ;;
+        LVM2_member)
+            vg=$(pvs --noheadings -o vg_name "$p" 2>/dev/null | tr -d ' ' || true)
+            [ -n "$vg" ] || continue
+            [ -n "$(lvs --noheadings -o lv_active "$vg" 2>/dev/null | grep -w active)" ] && continue
+            if vgchange -ay "$vg" >/dev/null; then ACTIVATED_VGS+=("$vg"); again=1; fi ;;
+        esac
+    done
+    if [ -n "$again" ]; then udevadm settle 2>/dev/null || true; unlock "$@"; fi   # LVM on LUKS
+}
+
+# The device holding the live session itself is never a candidate.
+live_disks=$(for m in /run/live/medium /run/live/persistence/* /lib/live/mount/medium; do
+    s=$(findmnt -nvo SOURCE "$m" 2>/dev/null) || continue
+    lsblk -sprno PATH,TYPE "$s" 2>/dev/null | awk '$2=="disk"{print $1}'
+done | sort -u || true)
+
+ROOTS=() ROOTINFO=()
+probe() {       # probe DEV -- is it the root of an installed system?
+    local p=$1 t m r sub= name
+    t=$(blkid -o value -s TYPE "$p" 2>/dev/null || true)
+    case $t in ext2|ext3|ext4|btrfs|xfs|f2fs|jfs|reiserfs) ;; *) return 0 ;; esac
+    m=$(mktemp -d /tmp/mount-chroot.XXXXXX)
+    if ! mount -o ro "$p" "$m" 2>/dev/null; then rmdir "$m"; return 0; fi
+    [ "$t" = btrfs ] && [ ! -e "$m/etc/fstab" ] && [ -e "$m/@/etc/fstab" ] && sub=@
+    r=$m/${sub:+$sub/}
+    # usr/lib first: etc/os-release may be an absolute symlink, i.e. into the live system
+    if [ -e "$r/etc/fstab" ] && { [ -f "$r/usr/lib/os-release" ] || [ -f "$r/etc/os-release" ]; }; then
+        name=$(. "$r/usr/lib/os-release" 2>/dev/null || . "$r/etc/os-release"; echo "${PRETTY_NAME:-${NAME:-Linux}}")
+        ROOTS+=("$p${sub:+:$sub}"); ROOTINFO+=("$name ($t${sub:+, subvol $sub})")
+    fi
+    umount "$m"; rmdir "$m"
+}
+
+if [ -n "$DEV" ]; then
+    [ -b "$DEV" ] || die "$DEV is not a block device"
+    devs=("$DEV")
+else
+    mapfile -t devs < <(lsblk -dpno PATH,TYPE | awk '$2=="disk"{print $1}' | grep -vxF "${live_disks:-/nonexistent}")
+fi
+[ ${#devs[@]} -gt 0 ] || die "no disks found apart from the live medium"
+unlock "${devs[@]}"
+for p in $(lsblk -rpno PATH "${devs[@]}" | awk '!seen[$0]++'); do
+    grep -qxF "$(lsblk -sprno PATH,TYPE "$p" | awk '$2=="disk"{print $1; exit}')" <<< "${live_disks:-/nonexistent}" && continue
+    probe "$p"
+done
+
+if [ -n "$LIST" ]; then
+    [ ${#ROOTS[@]} -gt 0 ] || { echo "no root filesystems found${DEV:+ on $DEV}"; exit 1; }
+    for i in "${!ROOTS[@]}"; do printf '%-24s %s\n' "${ROOTS[$i]%%:*}" "${ROOTINFO[$i]}"; done
+    exit 0
+fi
+case ${#ROOTS[@]} in
+    0) die "no root filesystem (with /etc/fstab and os-release) found${DEV:+ on $DEV}" ;;
+    1) pick=0 ;;
+    *)  echo "several installed systems found:" >&2
+        for i in "${!ROOTS[@]}"; do printf '  %d) %-22s %s\n' $((i+1)) "${ROOTS[$i]%%:*}" "${ROOTINFO[$i]}" >&2; done
+        [ -t 0 ] || die "pick one with --dev <partition>"
+        read -rp "which one? " n
+        [[ $n =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le ${#ROOTS[@]} ] || die "no such entry"
+        pick=$((n-1)) ;;
+esac
+ROOTDEV=${ROOTS[$pick]%%:*}; ROOTSUB=; [[ ${ROOTS[$pick]} == *:* ]] && ROOTSUB=${ROOTS[$pick]#*:}
+log "root: $ROOTDEV -- ${ROOTINFO[$pick]}"
+
+# ---- mount the root and its fstab ------------------------------------------------------
+mountpoint -q "$MNT" && die "$MNT is already mounted (mount-chroot --umount --mnt $MNT, or pick another --mnt)"
+domount ${ROOTSUB:+-o subvol=$ROOTSUB} "$ROOTDEV" "$MNT" || die "cannot mount $ROOTDEV"
+
+resolve() {     # fstab spec -> device node
+    case $1 in
+        UUID=*|LABEL=*|PARTUUID=*|PARTLABEL=*) blkid -l -o device -t "$1" 2>/dev/null ;;
+        /dev/*) [ -b "$1" ] && echo "$1" ;;
+    esac
+}
+FSTAB_EFI=
+# deepest mount points last: /boot before /boot/efi, whatever the fstab order
+while read -r spec dir fstype opts; do
+    case $fstype in
+        swap|none|proc|sysfs|devpts|tmpfs|devtmpfs|nfs|nfs4|cifs|smb3|smbfs|sshfs|fuse*|autofs|9p|virtiofs) continue ;;
+    esac
+    case ,$opts, in *,noauto,*|*,bind,*|*,rbind,*) continue ;; esac
+    case $dir in /boot/efi|/efi) FSTAB_EFI=$dir ;; esac
+    # a symlinked mount point could lead out of the chroot, onto the live system
+    case $(realpath -m "$MNT$dir") in "$MNT"/*) ;; *) warn "fstab: $dir is a symlink out of the root -- not mounted"; continue ;; esac
+    src=$(resolve "$spec")
+    if [ -z "$src" ]; then warn "fstab: $spec for $dir not found -- not mounted"; continue; fi
+    if domount -t "$fstype" -o "$opts" "$src" "$MNT$dir"; then log "mounted $src on $dir"
+    else warn "fstab: could not mount $src on $dir"; fi
+done < <(awk '!/^[ \t]*#/ && NF>=3 && $2 ~ "^/." { print $1, $2, $3, ($4==""?"defaults":$4) }' "$MNT/etc/fstab" \
+         | awk '{ print gsub("/","/",$2), $0 }' | sort -sn -k1,1 | cut -d' ' -f2-)
+
+# API filesystems.  /run is a fresh tmpfs; udev's database is bound in so
+# grub-probe and lvm can see device properties.
+domount -t proc proc "$MNT/proc"
+domount -t sysfs sysfs "$MNT/sys"
+domount --bind /dev "$MNT/dev"
+domount --bind /dev/pts "$MNT/dev/pts"
+domount -t tmpfs tmpfs "$MNT/run"
+[ -d /run/udev ] && domount --bind /run/udev "$MNT/run/udev"
+if [ -d /sys/firmware/efi/efivars ] && [ -d "$MNT/sys/firmware/efi/efivars" ]; then
+    domount -t efivarfs efivarfs "$MNT/sys/firmware/efi/efivars" || warn "efivarfs not mounted"
+fi
+
+if [ -n "$NET" ]; then
+    # Never write into the installed /etc: a resolv.conf symlink points into
+    # /run (our tmpfs); a plain file gets the live one bound over it.
+    rc=$MNT/etc/resolv.conf
+    if [ -L "$rc" ]; then
+        t=$(readlink "$rc"); case $t in /*) ;; *) t=/etc/$t ;; esac; t=$(realpath -ms "$t")
+        case $t in /run/*) mkdir -p "$MNT$(dirname "$t")"; cp -L /etc/resolv.conf "$MNT$t" ;;
+                   *) warn "resolv.conf points to $t, outside /run -- DNS not set up" ;; esac
+    else
+        if [ -f "$rc" ]; then
+            cp -L /etc/resolv.conf "$MNT/run/mount-chroot-resolv.conf"
+            domount --bind "$MNT/run/mount-chroot-resolv.conf" "$rc"
+        else warn "no /etc/resolv.conf in the installed system -- DNS not set up"; fi
+    fi
+fi
+
+inroot() { chroot "$MNT" /usr/bin/env LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$@"; }
+has()    { inroot sh -c "command -v $1" >/dev/null 2>&1; }
+
+# ---- GRUB repair ----------------------------------------------------------------
+ESP_GUID=c12a7328-f81f-11d2-ba4b-00a0c93ec93b
+topdisk() { lsblk -sprno PATH,TYPE "$1" | awk '$2=="disk"{print $1; exit}'; }
+
+fix_grub() {
+    local gi=grub-install mk= gdir=/boot/grub esp= espdev disk efitarget
+    has grub-install || { has grub2-install && gi=grub2-install && gdir=/boot/grub2; } \
+        || die "no grub-install in the installed system -- install its grub package (--net, then apt/dnf/pacman in a --shell)"
+    case $(uname -m) in x86_64) efitarget=x86_64-efi ;; aarch64) efitarget=arm64-efi ;; *) efitarget= ;; esac
+
+    # the ESP: the fstab's /boot/efi or /efi, else a vfat /boot that is an ESP (Arch, systemd-boot style)
+    for d in $FSTAB_EFI /boot/efi /efi /boot; do
+        [ -n "$d" ] && mountpoint -q "$MNT$d" || continue
+        espdev=$(findmnt -nvo SOURCE "$MNT$d")
+        if [ "$(lsblk -no PARTTYPE "$espdev" 2>/dev/null)" = $ESP_GUID ] || [ "$(lsblk -no PARTTYPE "$espdev" 2>/dev/null)" = 0xef ] \
+           || { [ "$d" != /boot ] && [ "$(findmnt -no FSTYPE "$MNT$d")" = vfat ]; }; then esp=$d; break; fi
+    done
+    if [ -z "$MODE" ]; then
+        # what the installed GRUB was set up for, else what the disk looks like, else how we booted
+        if [ -d "$MNT$gdir/$efitarget" ] && [ ! -d "$MNT$gdir/i386-pc" ]; then MODE=uefi
+        elif [ -d "$MNT$gdir/i386-pc" ] && [ ! -d "$MNT$gdir/$efitarget" ]; then MODE=bios
+        elif [ -n "$esp" ] && [ ! -d "$MNT$gdir/i386-pc" ]; then MODE=uefi
+        elif [ -d /sys/firmware/efi ]; then MODE=uefi
+        else MODE=bios; fi
+        log "boot mode: $MODE (detected; override with --bios / --uefi)"
+    fi
+
+    if [ "$MODE" = uefi ]; then
+        [ -n "$efitarget" ] || die "UEFI GRUB on $(uname -m) is not supported here"
+        [ -n "$esp" ] || die "no EFI system partition mounted (fstab has no /boot/efi?) -- mount it on $MNT/boot/efi and rerun with --keep/--shell, or use --bios"
+        [ -d "$MNT/usr/lib/grub/$efitarget" ] || die "the installed system lacks GRUB's $efitarget files -- install grub-efi-amd64 (Debian/Ubuntu) or grub (Arch) first"
+        local opts=(--target="$efitarget" --efi-directory="$esp")
+        [ -n "$EFIID" ] && opts+=(--bootloader-id="$EFIID")
+        if [ ! -d /sys/firmware/efi ]; then
+            warn "this live session booted in BIOS mode: no firmware boot entry can be written (--no-nvram); adding the fallback loader so the disk still boots"
+            opts+=(--no-nvram); REMOVABLE=1
+        fi
+        log "grub-install ${opts[*]}  (ESP $espdev on $esp)"
+        inroot $gi "${opts[@]}"
+        if [ -n "$REMOVABLE" ]; then
+            log "fallback loader EFI/BOOT"
+            inroot $gi "${opts[@]}" --removable --no-nvram
+        fi
+        if [ -d /sys/firmware/efi ] && has efibootmgr; then inroot efibootmgr | head -20 | sed 's/^/   /' >&2 || true; fi
+    else
+        [ -d "$MNT/usr/lib/grub/i386-pc" ] || die "the installed system lacks GRUB's i386-pc files -- install grub-pc (Debian/Ubuntu) or grub (Arch) first"
+        disk=${BDISK:-}
+        if [ -z "$disk" ]; then
+            if [ -n "$DEV" ] && [[ $(lsblk -dno TYPE "$DEV") == @(disk|loop) ]]; then disk=$DEV
+            else disk=$(topdisk "$(findmnt -nvo SOURCE "$MNT/boot" 2>/dev/null || findmnt -nvo SOURCE "$MNT")"); fi
+        fi
+        [[ $(lsblk -dno TYPE "$disk" 2>/dev/null) == @(disk|loop) ]] || die "BIOS boot code goes on a whole disk; $disk is not one (use --disk)"
+        if [ "$(blkid -o value -s PTTYPE "$disk")" = gpt ] && ! lsblk -rno PARTTYPE "$disk" | grep -qi 21686148-6449-6e6f-744e-656564454649; then
+            warn "$disk is GPT without a BIOS boot partition (type ef02): grub-install will refuse; add a 1 MiB one, or use --uefi"
+        fi
+        log "grub-install --target=i386-pc $disk"
+        inroot $gi --target=i386-pc "$disk"
+        # keep Debian/Ubuntu's grub-pc upgrades writing to the same disk
+        if inroot dpkg-query -W -f='${Status}' grub-pc 2>/dev/null | grep -q 'ok installed'; then
+            local id; id=$(find -L /dev/disk/by-id -samefile "$disk" 2>/dev/null | grep -v -- '-part\|/wwn-\|/nvme-eui' | sort | head -1 || true)
+            echo "grub-pc grub-pc/install_devices multiselect ${id:-$disk}" | inroot debconf-set-selections
+        fi
+    fi
+
+    if [ -n "$INITRAMFS" ]; then
+        if has update-initramfs; then inroot update-initramfs -u -k all
+        elif has mkinitcpio; then inroot mkinitcpio -P
+        elif has dracut; then inroot dracut -f --regenerate-all
+        else warn "no initramfs tool found"; fi
+    fi
+    if has update-grub; then mk=(update-grub)
+    elif has grub-mkconfig; then mk=(grub-mkconfig -o /boot/grub/grub.cfg)
+    else mk=(grub2-mkconfig -o /boot/grub2/grub.cfg); fi
+    log "${mk[*]}"
+    inroot "${mk[@]}"
+    log "GRUB repaired ($MODE) for $ROOTDEV"
+}
+
+shell_in() {
+    log "chroot shell in $MNT -- exit to unmount${KEEP:+ (--keep: stays mounted)}"
+    local sh=/bin/bash; [ -x "$MNT$sh" ] || sh=/bin/sh
+    chroot "$MNT" /usr/bin/env LC_ALL=C TERM="${TERM:-linux}" HOME=/root PS1='(chroot) \u@\h:\w\$ ' \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin $sh -i || true
+}
+
+[ -n "$INITRAMFS" ] && [ -z "$FIXGRUB" ] && warn "--initramfs only applies with --fix-grub"
+[ -n "$FIXGRUB" ] && fix_grub
+if [ ${#CMD[@]} -gt 0 ]; then
+    log "running: ${CMD[*]}"
+    inroot "${CMD[@]}" || { rc=$?; warn "command exited $rc"; [ -n "$SHELL_AFTER" ] || exit $rc; }
+fi
+if [ -n "$SHELL_AFTER" ] || { [ -z "$FIXGRUB" ] && [ ${#CMD[@]} -eq 0 ]; }; then
+    if [ -t 0 ]; then shell_in
+    else warn "no terminal for a shell"; [ -n "$KEEP" ] || log "use --keep to leave $MNT mounted"; fi
+fi

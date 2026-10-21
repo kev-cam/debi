@@ -57,7 +57,8 @@ mkdir "$tmp/x"; tar -xzf "$tmp/t.tgz" -C "$tmp/x" || die "not a valid .tar.gz"
 [ -n "$sha" ] || sha=$(gzip -dc "$tmp/t.tgz" | head -c 4096 | grep -aoE 'comment=[0-9a-f]{40}' | head -1 | cut -d= -f2 || true)
 src=$(find "$tmp/x" -mindepth 1 -maxdepth 2 -name m2d -type f -printf '%h\n' | head -1)
 [ -n "$src" ] && [ -f "$src/lib.sh" ] || die "tarball does not contain the mint2deb toolkit"
-for f in "$src"/m2d* "$src"/lib.sh; do
+for f in "$src"/m2d* "$src"/lib.sh "$src"/mount-chroot; do
+    [ -f "$f" ] || continue
     case $f in *.in) continue ;; esac
     bash -n "$f" || die "syntax error in $(basename "$f") -- nothing installed"
 done
@@ -75,6 +76,8 @@ done <<<"$new_list"
 gone=$(comm -23 <(echo "$old_list") <(echo "$new_list") | grep -vx 'm2d-update' | grep . || true)
 for f in $gone; do rm -f "$M2D_HOME/$f"; done
 echo "$new_list" > "$M2D_HOME/.m2d-manifest"
+# on the stick, keep the standalone rescue tool on PATH as m2d-prep-usb does
+[ "$M2D_HOME" = /opt/mint2deb ] && [ -f "$M2D_HOME/mount-chroot" ] && ln -sfn "$M2D_HOME/mount-chroot" /usr/local/sbin/mount-chroot
 if [ -n "$FROM" ]; then from="file:$(basename "$FROM")"; else from="$REPO@$REF"; fi
 ver="${sha:-unknown} $from $(date -u +%Y-%m-%dT%H:%MZ)"
 echo "$ver" > "$M2D_HOME/.m2d-version"
