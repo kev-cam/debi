@@ -143,10 +143,18 @@ EOF
 # ---- repair -----------------------------------------------------------------
 [ "$MODE" = uefi ] && do_mount "$espdev" $R/boot/efi
 chroot_mounts $R
-rc=/etc/resolv.conf
-if [ -L "$R$rc" ]; then t=$(readlink "$R$rc"); case $t in /*) ;; *) t=/etc/$t ;; esac
-    rc=$(realpath -ms "$t"); mkdir -p "$R$(dirname "$rc")"; fi
-cp -L /etc/resolv.conf "$R$rc" 2>/dev/null || true
+# DNS for apt, without writing into Mint's /etc: a resolv.conf symlink into
+# /run lands in the chroot's tmpfs; a plain file gets the live one bound over it.
+rc=$R/etc/resolv.conf
+if [ -L "$rc" ]; then
+    t=$(readlink "$rc"); case $t in /*) ;; *) t=/etc/$t ;; esac; t=$(realpath -ms "$t")
+    case $t in /run/*) mkdir -p "$R$(dirname "$t")"; cp -L /etc/resolv.conf "$R$t" 2>/dev/null || true ;;
+               *) warn "resolv.conf points to $t, outside /run -- no DNS in the chroot" ;; esac
+elif [ -f "$rc" ]; then
+    if cp -L /etc/resolv.conf $R/run/m2d-resolv.conf 2>/dev/null && mount --bind $R/run/m2d-resolv.conf "$rc"; then
+        M2D_MOUNTS+=("$rc")     # unmounted before /run by cleanup_mounts (reverse order)
+    else warn "no DNS in the chroot"; fi
+else warn "Mint has no /etc/resolv.conf -- no DNS in the chroot"; fi
 inr() { chroot $R /usr/bin/env DEBIAN_FRONTEND=noninteractive LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin "$@"; }
 
 log "finishing any half-configured packages"
