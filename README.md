@@ -270,8 +270,11 @@ Boot the stick and, as root, run:
     m2d fix-grub --dry-run      # shows the root, boot mode, target disk, kernels
     m2d fix-grub                # dpkg --configure -a, grub-install, update-grub
 
-This needs no survey. It finds the Mint root itself, or you can pass
-`--root`. It takes the boot mode from the platform directory grub-install last
+This needs no survey. It uses the root `m2d survey` recorded, or `--root`, or
+finds the Mint/Ubuntu root itself and asks if there are several. The mounting
+is done by `mount-chroot` (below), so a LUKS or LVM root works, Mint's whole
+fstab is mounted, and the DNS that apt needs never overwrites Mint's
+`/etc/resolv.conf`. `--dry-run` mounts everything read-only. It takes the boot mode from the platform directory grub-install last
 populated in Mint's `/boot/grub`, falling back to Mint's GRUB packages. It
 doesn't use how the stick booted. In UEFI mode, a boot manager that was first
 in the firmware order, such as rEFInd, stays first. In BIOS mode it installs to the disk named in Mint's own
@@ -292,10 +295,11 @@ in Mint's menu.
 `mount-chroot` mounts an installed system from the live session and chroots
 into it. It needs nothing else from the toolkit, so a copy on any rescue stick
 works. `m2d-prep-usb` links it as `/usr/local/sbin/mount-chroot`.
-Use `m2d fix-grub` for a Mint or Ubuntu system, since it also repairs
-half-configured packages and follows Mint's own debconf. Use `mount-chroot`
-for any other distribution, for LUKS or LVM roots, or when you just need a
-shell inside the installed system.
+Use `m2d fix-grub` for a Mint or Ubuntu system. It mounts through
+`mount-chroot`, then also repairs half-configured packages, follows Mint's own
+debconf and keeps rEFInd first. Use `mount-chroot --fix-grub` for any other
+distribution, or plain `mount-chroot` when you just need a shell inside the
+installed system.
 
     mount-chroot --dev /dev/nvme0n1 --fix-grub   # find the root on the disk, reinstall GRUB
     mount-chroot --dev /dev/sda6                 # mount that root and open a shell in it
@@ -306,7 +310,11 @@ Given a disk, it looks for root filesystems, meaning ones with `/etc/fstab` and
 to use if it finds more than one. It then mounts everything else in that
 system's fstab, deepest mount points last, skipping network, `noauto` and bind
 entries. Finally it binds `/dev`, `/proc`, `/sys`, `efivarfs` and a fresh
-`/run`. Everything is unmounted on exit unless `--keep` is given.
+`/run`. Everything is unmounted on exit unless `--keep` is given;
+`mount-chroot --umount` then unmounts it and closes the LUKS and LVM devices
+that run opened. For scripts, `--mount` only mounts, implies `--keep` and
+opens no shell; `--ro` mounts read-only and `--os linuxmint,ubuntu` limits
+the search to those `os-release` IDs. `m2d fix-grub` uses all three.
 
 `--fix-grub` decides the boot mode from the GRUB platform directories in the
 installed `/boot/grub`, the same test `m2d survey` uses. If both are present,

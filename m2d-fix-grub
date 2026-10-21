@@ -2,12 +2,13 @@
 # m2d-fix-grub [--root DEV] [--disk DEV] [--mode bios|uefi] [--reinstall]
 #              [--initramfs] [--nomodeset] [--dry-run]
 # Rescue: make an installed Mint (or Ubuntu) system bootable again from the
-# live USB.  Mounts its root (plus /boot and the ESP from its own fstab),
-# chroots in, repairs half-configured packages, and re-runs grub-install +
-# update-grub.  Does not need m2d-survey; nothing else on the disk is touched.
+# live USB.  Mounts it with mount-chroot (its whole fstab; LUKS and LVM are
+# unlocked on the way), repairs half-configured packages, and re-runs
+# grub-install + update-grub.  Does not need m2d-survey; nothing else on the
+# disk is touched.
 #
 #   --root DEV    Mint root partition (default: the one m2d surveyed, else the
-#                 single linuxmint/ubuntu ext4 root found)
+#                 Mint/Ubuntu root found -- asked on a terminal if several)
 #   --disk DEV    BIOS only: disk whose MBR gets GRUB (default: what Mint's own
 #                 debconf grub-pc/install_devices says, else the root's disk)
 #   --mode M      bios|uefi (default: from the grub packages Mint has installed;
@@ -38,52 +39,35 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-is_mint_root() {   # is_mint_root dev -> 0 if it holds a Mint/Ubuntu root
-    local m=/mnt/m2d-fix-probe r=1
-    mkdir -p $m
-    mount -o ro "$1" $m 2>/dev/null || return 1
-    grep -qsE '^ID=(linuxmint|ubuntu)' $m/etc/os-release && [ -x $m/usr/bin/dpkg ] && r=0
-    umount $m
-    return $r
-}
-
-# ---- which root -------------------------------------------------------------
+# ---- which root, mounted --------------------------------------------------------
 if [ -z "$ROOT" ] && [ -f "$M2D_HOME/hosts/current/state.env" ]; then
     ROOT=$(. "$M2D_HOME/hosts/current/state.env"; echo "${MINT_DEV:-}")
     # device names can move between boots: trust the UUID if we have it
     uuid=$(. "$M2D_HOME/hosts/current/state.env"; echo "${MINT_UUID:-}")
     [ -n "$uuid" ] && [ -e "/dev/disk/by-uuid/$uuid" ] && ROOT=$(readlink -f "/dev/disk/by-uuid/$uuid")
 fi
-if [ -z "$ROOT" ]; then
-    live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || true)
-    live_disk=${live_src:+$(lsblk -no PKNAME "$live_src" | head -1)}
-    cands=()
-    while read -r name fstype; do
-        [ "$fstype" = ext4 ] || continue
-        [ -n "$live_disk" ] && [ "$(lsblk -no PKNAME "/dev/$name" | head -1)" = "$live_disk" ] && continue
-        is_mint_root "/dev/$name" && cands+=("/dev/$name")
-    done < <(lsblk -rno NAME,FSTYPE)
-    [ ${#cands[@]} -eq 1 ] || die "found ${#cands[@]} Mint/Ubuntu roots (${cands[*]:-none}); pass --root"
-    ROOT=${cands[0]}
-fi
-[ -b "$ROOT" ] || die "$ROOT is not a block device"
-if findmnt -rn -S "$ROOT" >/dev/null; then
-    die "$ROOT is mounted ($(findmnt -rno TARGET -S "$ROOT" | tr '\n' ' ')) -- wait for other m2d steps to finish / unmount it"
+if [ -n "$ROOT" ]; then
+    [ -b "$ROOT" ] || die "$ROOT is not a block device"
+    if findmnt -rn -S "$ROOT" >/dev/null; then
+        die "$ROOT is mounted ($(findmnt -rno TARGET -S "$ROOT" | tr '\n' ' ')) -- wait for other m2d steps to finish / unmount it"
+    fi
 fi
 
+# mount-chroot finds the root when none is known, mounts it with its fstab and
+# the API filesystems (DNS via --net never writes into Mint's /etc), and
+# leaves it all mounted for us; the trap takes it down again.
 R=/mnt/m2d-fix
-if [ -n "$DRY" ]; then do_mount -o ro "$ROOT" $R; else do_mount "$ROOT" $R; fi
-grep -qsE '^ID=(linuxmint|ubuntu)' $R/etc/os-release || die "$ROOT is not a Mint/Ubuntu root"
+MC=$M2D_HOME/mount-chroot
+mountpoint -q $R && die "$R is mounted -- another m2d fix-grub running? (else: $MC --umount --mnt $R)"
+trap 'mountpoint -q '$R' && "$MC" --umount --mnt '$R' || true' EXIT
+"$MC" --mount --net --mnt $R --os linuxmint,ubuntu ${ROOT:+--dev "$ROOT"} ${DRY:+--ro} \
+    || die "no Mint/Ubuntu root mounted${ROOT:+ from $ROOT} (pass --root if several were found)"
+ROOT=$(findmnt -nvo SOURCE $R)
 name=$(. $R/etc/os-release; echo "$PRETTY_NAME")
-
-# /boot and ESP from the system's own fstab
-fsdev() { case $1 in UUID=*|LABEL=*|PARTUUID=*|PARTLABEL=*) findfs "$1" 2>/dev/null ;; /dev/*) echo "$1" ;; esac; }
-bootspec=$(awk '$1!~/^#/ && $2=="/boot" {print $1}' $R/etc/fstab)
-espspec=$(awk '$1!~/^#/ && $2=="/boot/efi" {print $1}' $R/etc/fstab)
-bootdev=${bootspec:+$(fsdev "$bootspec")}
-espdev=${espspec:+$(fsdev "$espspec")}
-[ -z "$bootspec" ] || [ -n "$bootdev" ] || die "/boot ($bootspec) from fstab not found"
-[ -n "$bootdev" ] && { if [ -n "$DRY" ]; then do_mount -o ro "$bootdev" $R/boot; else do_mount "$bootdev" $R/boot; fi; }
+fstab_has() { awk -v d="$1" '$1!~/^#/ && $2==d {f=1} END {exit !f}' $R/etc/fstab; }
+bootdev=$(findmnt -nvo SOURCE $R/boot 2>/dev/null || true)
+espdev=$(findmnt -nvo SOURCE $R/boot/efi 2>/dev/null || true)
+fstab_has /boot && [ -z "$bootdev" ] && die "/boot from $ROOT's fstab could not be mounted"
 
 # ---- mode -------------------------------------------------------------------
 pkg_ok() { grep -A1 -x "Package: $1" $R/var/lib/dpkg/status | grep -c 'Status: install ok installed' >/dev/null; }
@@ -108,7 +92,7 @@ if [ "$MODE" = bios ]; then
         dc=$(awk '/^Name: grub-pc\/install_devices$/{f=1} f&&/^Value:/{sub(/^Value: */,""); print; exit}' \
              $R/var/cache/debconf/config.dat 2>/dev/null | tr ',' '\n' | awk 'NF{print $1; exit}')
         if [ -n "$dc" ] && [ -e "$dc" ]; then DISK=$(readlink -f "$dc"); src="Mint debconf ($dc)"
-        else DISK=/dev/$(lsblk -no PKNAME "$ROOT" | head -1); src="disk holding $ROOT"; fi
+        else DISK=$(lsblk -sprno PATH,TYPE "${bootdev:-$ROOT}" | awk '$2=="disk"{print $1; exit}'); src="disk holding ${bootdev:+/boot}${bootdev:-$ROOT}"; fi
     fi
     [ -b "$DISK" ] && [ "$(lsblk -dno TYPE "$DISK")" = disk ] || die "$DISK is not a whole disk"
     pt=$(blkid -o value -s PTTYPE "$DISK" || true)
@@ -117,7 +101,10 @@ if [ "$MODE" = bios ]; then
     fi
     target="MBR of $DISK ($(lsblk -dno MODEL,SIZE "$DISK" | xargs)) [from $src]"
 else
-    [ -n "$espdev" ] || die "UEFI mode but no /boot/efi in $ROOT's fstab"
+    if [ -z "$espdev" ]; then
+        if fstab_has /boot/efi; then die "UEFI mode but the ESP (/boot/efi in $ROOT's fstab) could not be mounted"
+        else die "UEFI mode but no /boot/efi in $ROOT's fstab"; fi
+    fi
     target="ESP $espdev"
     [ "$live_mode" = uefi ] || warn "live USB booted BIOS: cannot write EFI boot entries; installing to the fallback path too"
 fi
@@ -141,20 +128,6 @@ EOF
 [ -z "$DRY" ] || { echo; echo "Dry run: nothing written."; exit 0; }
 
 # ---- repair -----------------------------------------------------------------
-[ "$MODE" = uefi ] && do_mount "$espdev" $R/boot/efi
-chroot_mounts $R
-# DNS for apt, without writing into Mint's /etc: a resolv.conf symlink into
-# /run lands in the chroot's tmpfs; a plain file gets the live one bound over it.
-rc=$R/etc/resolv.conf
-if [ -L "$rc" ]; then
-    t=$(readlink "$rc"); case $t in /*) ;; *) t=/etc/$t ;; esac; t=$(realpath -ms "$t")
-    case $t in /run/*) mkdir -p "$R$(dirname "$t")"; cp -L /etc/resolv.conf "$R$t" 2>/dev/null || true ;;
-               *) warn "resolv.conf points to $t, outside /run -- no DNS in the chroot" ;; esac
-elif [ -f "$rc" ]; then
-    if cp -L /etc/resolv.conf $R/run/m2d-resolv.conf 2>/dev/null && mount --bind $R/run/m2d-resolv.conf "$rc"; then
-        M2D_MOUNTS+=("$rc")     # unmounted before /run by cleanup_mounts (reverse order)
-    else warn "no DNS in the chroot"; fi
-else warn "Mint has no /etc/resolv.conf -- no DNS in the chroot"; fi
 inr() { chroot $R /usr/bin/env DEBIAN_FRONTEND=noninteractive LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin "$@"; }
 
 log "finishing any half-configured packages"

@@ -21,6 +21,9 @@
 #   --shell         open a shell after --fix-grub or a command as well
 #   --mnt DIR       where to mount the root (default /mnt/chroot)
 #   --keep          leave everything mounted on exit;  --umount [--mnt DIR] undoes it
+#   --mount         just mount (implies --keep): for scripts that work on DIR themselves
+#   --ro            mount the root and its fstab read-only
+#   --os IDS        only consider systems whose os-release ID is in IDS (e.g. linuxmint,ubuntu)
 # Single or double dashes both work: -dev /dev/sda -fix-grub.
 # fstab entries that are network, noauto or bind mounts are skipped; the rest
 # are mounted as the installed system would mount them.
@@ -31,7 +34,7 @@ warn() { echo "mount-chroot: WARNING: $*" >&2; }
 log()  { echo "== $*" >&2; }
 usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0"; exit "${1:-0}"; }
 
-DEV= MNT=/mnt/chroot FIXGRUB= MODE= BDISK= EFIID= REMOVABLE= INITRAMFS= NET= SHELL_AFTER= KEEP= UMOUNT= LIST=
+DEV= MNT=/mnt/chroot FIXGRUB= MODE= BDISK= EFIID= REMOVABLE= INITRAMFS= NET= SHELL_AFTER= KEEP= UMOUNT= LIST= MOUNTONLY= RO= OSIDS=
 CMD=()
 while [ $# -gt 0 ]; do
     a=$1; shift
@@ -50,6 +53,9 @@ while [ $# -gt 0 ]; do
         --net)       NET=1 ;;
         --shell)     SHELL_AFTER=1 ;;
         --keep)      KEEP=1 ;;
+        --mount)     MOUNTONLY=1 KEEP=1 ;;
+        --ro)        RO=1 ;;
+        --os)        OSIDS=${1:?--os needs IDs}; shift ;;
         --umount)    UMOUNT=1 ;;
         --list)      LIST=1 ;;
         -h|--help)   usage ;;
@@ -61,9 +67,16 @@ done
 [ "$(id -u)" = 0 ] || die "must run as root"
 MNT=${MNT%/}
 
+OPENED=run/mount-chroot.opened     # what a --keep run unlocked, for --umount to close
 if [ -n "$UMOUNT" ]; then
     mountpoint -q "$MNT" || die "$MNT is not mounted"
-    umount -R "$MNT" 2>/dev/null || { warn "busy -- detaching lazily"; umount -R -l "$MNT"; }
+    opened=$(cat "$MNT/$OPENED" 2>/dev/null || true)
+    if umount -R "$MNT" 2>/dev/null; then
+        while read -r kind name; do
+            case $kind in vg) vgchange -an "$name" >/dev/null 2>&1 || true ;;
+                          luks) cryptsetup close "$name" 2>/dev/null || true ;; esac
+        done <<< "$opened"
+    else warn "busy -- detaching lazily (LUKS/LVM left open)"; umount -R -l "$MNT"; fi
     log "unmounted $MNT"; exit 0
 fi
 
@@ -71,8 +84,12 @@ fi
 MOUNTS=() OPENED_LUKS=() ACTIVATED_VGS=()
 cleanup() {
     local i
-    if [ -n "$KEEP" ] && [ -z "$LIST" ] && mountpoint -q "$MNT"; then
-        log "left mounted at $MNT -- undo with: mount-chroot --umount --mnt $MNT"; return
+    if [ -n "$KEEP" ] && [ ${#MOUNTS[@]} -gt 0 ]; then     # only what this run mounted
+        # vgs first: LVM may sit on LUKS.  Only into our tmpfs, never the installed /run.
+        mountpoint -q "$MNT/run" && { for i in "${ACTIVATED_VGS[@]}"; do echo "vg $i"; done
+          for i in "${OPENED_LUKS[@]}"; do echo "luks $i"; done
+        } > "$MNT/$OPENED" 2>/dev/null || true
+        log "mounted at $MNT -- mount-chroot --umount --mnt $MNT undoes it"; return
     fi
     for ((i=${#MOUNTS[@]}-1; i>=0; i--)); do
         umount "${MOUNTS[$i]}" 2>/dev/null || umount -l "${MOUNTS[$i]}" 2>/dev/null || true
@@ -121,7 +138,7 @@ done | sort -u || true)
 
 ROOTS=() ROOTINFO=()
 probe() {       # probe DEV -- is it the root of an installed system?
-    local p=$1 t m r sub= name
+    local p=$1 t m r sub= name id
     t=$(blkid -o value -s TYPE "$p" 2>/dev/null || true)
     case $t in ext2|ext3|ext4|btrfs|xfs|f2fs|jfs|reiserfs) ;; *) return 0 ;; esac
     m=$(mktemp -d /tmp/mount-chroot.XXXXXX)
@@ -131,7 +148,10 @@ probe() {       # probe DEV -- is it the root of an installed system?
     # usr/lib first: etc/os-release may be an absolute symlink, i.e. into the live system
     if [ -e "$r/etc/fstab" ] && { [ -f "$r/usr/lib/os-release" ] || [ -f "$r/etc/os-release" ]; }; then
         name=$(. "$r/usr/lib/os-release" 2>/dev/null || . "$r/etc/os-release"; echo "${PRETTY_NAME:-${NAME:-Linux}}")
-        ROOTS+=("$p${sub:+:$sub}"); ROOTINFO+=("$name ($t${sub:+, subvol $sub})")
+        id=$(. "$r/usr/lib/os-release" 2>/dev/null || . "$r/etc/os-release"; echo "${ID:-}")
+        if [ -z "$OSIDS" ] || [[ ,$OSIDS, == *,"$id",* ]]; then
+            ROOTS+=("$p${sub:+:$sub}"); ROOTINFO+=("$name ($t${sub:+, subvol $sub})")
+        fi
     fi
     umount "$m"; rmdir "$m"
 }
@@ -155,7 +175,7 @@ if [ -n "$LIST" ]; then
     exit 0
 fi
 case ${#ROOTS[@]} in
-    0) die "no root filesystem (with /etc/fstab and os-release) found${DEV:+ on $DEV}" ;;
+    0) die "no root filesystem (with /etc/fstab and os-release${OSIDS:+, ID $OSIDS}) found${DEV:+ on $DEV}" ;;
     1) pick=0 ;;
     *)  echo "several installed systems found:" >&2
         for i in "${!ROOTS[@]}"; do printf '  %d) %-22s %s\n' $((i+1)) "${ROOTS[$i]%%:*}" "${ROOTINFO[$i]}" >&2; done
@@ -169,7 +189,8 @@ log "root: $ROOTDEV -- ${ROOTINFO[$pick]}"
 
 # ---- mount the root and its fstab ------------------------------------------------------
 mountpoint -q "$MNT" && die "$MNT is already mounted (mount-chroot --umount --mnt $MNT, or pick another --mnt)"
-domount ${ROOTSUB:+-o subvol=$ROOTSUB} "$ROOTDEV" "$MNT" || die "cannot mount $ROOTDEV"
+ropts=${RO:+ro}${ROOTSUB:+${RO:+,}subvol=$ROOTSUB}
+domount ${ropts:+-o "$ropts"} "$ROOTDEV" "$MNT" || die "cannot mount $ROOTDEV"
 
 resolve() {     # fstab spec -> device node
     case $1 in
@@ -187,9 +208,9 @@ while read -r spec dir fstype opts; do
     case $dir in /boot/efi|/efi) FSTAB_EFI=$dir ;; esac
     # a symlinked mount point could lead out of the chroot, onto the live system
     case $(realpath -m "$MNT$dir") in "$MNT"/*) ;; *) warn "fstab: $dir is a symlink out of the root -- not mounted"; continue ;; esac
-    src=$(resolve "$spec")
+    src=$(resolve "$spec" || true)
     if [ -z "$src" ]; then warn "fstab: $spec for $dir not found -- not mounted"; continue; fi
-    if domount -t "$fstype" -o "$opts" "$src" "$MNT$dir"; then log "mounted $src on $dir"
+    if domount -t "$fstype" -o "$opts${RO:+,ro}" "$src" "$MNT$dir"; then log "mounted $src on $dir"
     else warn "fstab: could not mount $src on $dir"; fi
 done < <(awk '!/^[ \t]*#/ && NF>=3 && $2 ~ "^/." { print $1, $2, $3, ($4==""?"defaults":$4) }' "$MNT/etc/fstab" \
          | awk '{ print gsub("/","/",$2), $0 }' | sort -sn -k1,1 | cut -d' ' -f2-)
@@ -217,7 +238,7 @@ if [ -n "$NET" ]; then
     else
         if [ -f "$rc" ]; then
             cp -L /etc/resolv.conf "$MNT/run/mount-chroot-resolv.conf"
-            domount --bind "$MNT/run/mount-chroot-resolv.conf" "$rc"
+            mount --bind "$MNT/run/mount-chroot-resolv.conf" "$rc" && MOUNTS+=("$rc")   # a file: not domount's mkdir
         else warn "no /etc/resolv.conf in the installed system -- DNS not set up"; fi
     fi
 fi
@@ -316,7 +337,7 @@ if [ ${#CMD[@]} -gt 0 ]; then
     log "running: ${CMD[*]}"
     inroot "${CMD[@]}" || { rc=$?; warn "command exited $rc"; [ -n "$SHELL_AFTER" ] || exit $rc; }
 fi
-if [ -n "$SHELL_AFTER" ] || { [ -z "$FIXGRUB" ] && [ ${#CMD[@]} -eq 0 ]; }; then
+if [ -n "$SHELL_AFTER" ] || { [ -z "$FIXGRUB" ] && [ ${#CMD[@]} -eq 0 ] && [ -z "$MOUNTONLY" ]; }; then
     if [ -t 0 ]; then shell_in
     else warn "no terminal for a shell"; [ -n "$KEEP" ] || log "use --keep to leave $MNT mounted"; fi
 fi
